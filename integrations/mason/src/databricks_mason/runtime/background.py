@@ -10,6 +10,7 @@ timeout) with the same interface — ``runtime/runtime.py`` only depends on
 ``start``/``complete``/``fail``/``get``.
 """
 
+import copy
 import uuid
 from typing import Any
 
@@ -28,8 +29,12 @@ class BackgroundRuns:
     def complete(self, invocation_id: str, output: dict) -> None:
         self._runs[invocation_id] = {"status": "completed", "output": output, "error": None}
 
-    def fail(self, invocation_id: str, error: str) -> None:
-        self._runs[invocation_id] = {"status": "failed", "output": None, "error": error}
+    def fail(self, invocation_id: str, error: dict[str, Any]) -> None:
+        self._runs[invocation_id] = {
+            "status": "failed",
+            "output": None,
+            "error": copy.deepcopy(error),
+        }
 
     def get(self, invocation_id: str) -> dict | None:
         """The run's record — ``status`` plus ``output`` (when completed) or ``error`` (when failed);

@@ -4,6 +4,10 @@ command: ["uv", "run", "start-server"]
 # No env vars are required by default: the app runs the lean backend (in-process checkpointer,
 # tracing off). To enable tracing, long-term memory, or durable state, add the matching entries
 # below (literal values):
+# Databricks tool identity is configured in agent/databricks_tools.py when the tool is added.
+# Sandbox/MCP default to request-user auth; deployed OBO uses the App's ai-gateway scope and callers
+# may need to re-enter/re-consent after it changes. auth="app" means the dedicated App service
+# principal, never the creator. External calls without scoped forwarded user auth fail closed.
 #
 # env:
 #   # Tracing (set a destination + an experiment). Destination: MLFLOW_TRACKING_URI or

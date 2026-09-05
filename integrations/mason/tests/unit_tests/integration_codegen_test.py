@@ -13,6 +13,12 @@ from databricks_mason.integration_codegen import (
 from databricks_mason.integrations import MCPService, Sandbox, Scope, UCFunction
 
 
+def _write_registry_source(root, source: str) -> None:
+    path = root / "agent" / "databricks_tools.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(source, encoding="utf-8")
+
+
 def test_registry_round_trips_canonical_python_without_executing_it(tmp_path) -> None:
     registry = IntegrationRegistry.empty(tmp_path)
     registry.add(
@@ -21,7 +27,7 @@ def test_registry_round_trips_canonical_python_without_executing_it(tmp_path) ->
             scopes=(Scope.table("samples.nyctaxi.trips"),),
         )
     )
-    registry.add(MCPService(id="web", service="system.ai.web_search"))
+    registry.add(MCPService(id="web", service="system.ai.web_search", auth="app"))
     registry.add(UCFunction(id="lookup", function="main.tools.lookup"))
 
     path = registry.write()
@@ -29,8 +35,44 @@ def test_registry_round_trips_canonical_python_without_executing_it(tmp_path) ->
 
     ast.parse(source)
     assert "DATABRICKS_TOOLS" in source
-    assert IntegrationRegistry.load(tmp_path).integrations == registry.integrations
+    assert '        auth="user",' in source
+    assert '        auth="app",' in source
+    loaded = IntegrationRegistry.load(tmp_path)
+    assert loaded.integrations == registry.integrations
+    assert loaded.legacy_auth_ids == frozenset()
     assert registry.definition_line("sandbox") > 0
+
+
+def test_registry_preserves_legacy_missing_auth_as_distinct_provenance(tmp_path) -> None:
+    integrations = [
+        Sandbox(id="sandbox", scopes=(Scope.volume("main.data.files"),)),
+        MCPService(id="web", service="system.ai.web_search"),
+    ]
+    explicit_source = render_registry(integrations)
+    legacy_source = explicit_source.replace('        auth="user",\n', "")
+    explicit_root = tmp_path / "explicit"
+    legacy_root = tmp_path / "legacy"
+    _write_registry_source(explicit_root, explicit_source)
+    _write_registry_source(legacy_root, legacy_source)
+
+    explicit = IntegrationRegistry.load(explicit_root)
+    legacy = IntegrationRegistry.load(legacy_root)
+
+    assert legacy.integrations == explicit.integrations
+    assert explicit.legacy_auth_ids == frozenset()
+    assert legacy.legacy_auth_ids == frozenset({"sandbox", "web"})
+
+
+def test_registry_refuses_to_write_unresolved_legacy_auth(tmp_path) -> None:
+    explicit_source = render_registry([MCPService(id="web", service="system.ai.web_search")])
+    legacy_source = explicit_source.replace('        auth="user",\n', "")
+    _write_registry_source(tmp_path, legacy_source)
+    registry = IntegrationRegistry.load(tmp_path)
+
+    with pytest.raises(AgentCliError, match='auth="user".*auth="app"'):
+        registry.write()
+
+    assert (tmp_path / "agent" / "databricks_tools.py").read_text(encoding="utf-8") == legacy_source
 
 
 def test_registry_rejects_dynamic_python_without_running_it(tmp_path) -> None:
@@ -64,6 +106,39 @@ def test_registry_add_is_idempotent_and_conflicts_by_id(tmp_path) -> None:
                 scopes=(Scope.volume("main.data.other"),),
             )
         )
+
+    registry = IntegrationRegistry.empty(tmp_path)
+    registry.add(MCPService(id="web", service="system.ai.web_search", auth="user"))
+    with pytest.raises(AgentCliError, match="different configuration.*auth=app"):
+        registry.add(MCPService(id="web", service="system.ai.web_search", auth="app"))
+
+
+@pytest.mark.parametrize(
+    "auth_template",
+    [
+        '"creator"',
+        "1",
+        "AUTH_MODE",
+        '"user", auth="app"',
+        '(__import__("pathlib").Path({marker}).write_text("bad") or "user")',
+    ],
+)
+def test_registry_rejects_invalid_or_non_literal_auth_without_execution(
+    tmp_path, auth_template: str
+) -> None:
+    marker = tmp_path / "executed"
+    auth_expression = auth_template.format(marker=repr(str(marker)))
+    source = render_registry([MCPService(id="web", service="system.ai.web_search")])
+    source = source.replace(
+        '        auth="user",',
+        f"        auth={auth_expression},",
+    )
+    _write_registry_source(tmp_path, source)
+
+    with pytest.raises(AgentCliError, match="auth|canonical|parse"):
+        IntegrationRegistry.load(tmp_path)
+
+    assert not marker.exists()
 
 
 def test_empty_registry_is_a_valid_importable_no_op(tmp_path) -> None:

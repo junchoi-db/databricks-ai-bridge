@@ -17,7 +17,10 @@ LangGraph already has, so migrating an existing agent is a graft, not a rewrite:
         model=...,
         tools=[
             *your_tools,
-            *await load_tools(DATABRICKS_TOOLS),
+            *await load_tools(
+                DATABRICKS_TOOLS,
+                workspace_client_for=request_auth.client_for,
+            ),
         ],
         checkpointer=checkpointer(),  # durable when AGENT_SESSION_STORE is set
     )

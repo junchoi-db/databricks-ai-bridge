@@ -10,9 +10,13 @@ from databricks_mason.errors import AgentCliError
 
 ScopeKind: TypeAlias = Literal["table", "volume", "workspace"]
 Permission: TypeAlias = Literal["read_only", "read_write"]
+AuthMode: TypeAlias = Literal["user", "app"]
 
 _SCOPE_KINDS = {"table", "volume", "workspace"}
 _PERMISSIONS = {"read_only", "read_write"}
+_AUTH_MODES = {"user", "app"}
+_AI_GATEWAY_USER_SCOPES = frozenset({"ai-gateway"})
+_NO_USER_SCOPES: frozenset[str] = frozenset()
 _INTEGRATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _UC_COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 
@@ -35,6 +39,11 @@ def _three_part_name(value: str, description: str) -> str:
 def _validate_id(value: str) -> None:
     if not isinstance(value, str) or not _INTEGRATION_ID.fullmatch(value):
         raise AgentCliError(f"Invalid integration id {value!r}.")
+
+
+def _validate_auth(value: AuthMode) -> None:
+    if not isinstance(value, str) or value not in _AUTH_MODES:
+        raise AgentCliError(f"Unsupported integration auth mode {value!r}.")
 
 
 @dataclass(frozen=True)
@@ -100,9 +109,11 @@ class Sandbox:
 
     id: str
     scopes: tuple[Scope, ...]
+    auth: AuthMode = "user"
 
     def __post_init__(self) -> None:
         _validate_id(self.id)
+        _validate_auth(self.auth)
         if not self.scopes:
             raise AgentCliError("Sandbox integrations require at least one scope.")
         if not isinstance(self.scopes, tuple) or any(
@@ -114,6 +125,10 @@ class Sandbox:
     def kind(self) -> str:
         return "sandbox"
 
+    @property
+    def required_user_scopes(self) -> frozenset[str]:
+        return _AI_GATEWAY_USER_SCOPES if self.auth == "user" else _NO_USER_SCOPES
+
 
 @dataclass(frozen=True)
 class MCPService:
@@ -121,14 +136,20 @@ class MCPService:
 
     id: str
     service: str
+    auth: AuthMode = "user"
 
     def __post_init__(self) -> None:
         _validate_id(self.id)
+        _validate_auth(self.auth)
         _three_part_name(self.service, "MCP service")
 
     @property
     def kind(self) -> str:
         return "mcp"
+
+    @property
+    def required_user_scopes(self) -> frozenset[str]:
+        return _AI_GATEWAY_USER_SCOPES if self.auth == "user" else _NO_USER_SCOPES
 
 
 @dataclass(frozen=True)
@@ -145,6 +166,10 @@ class UCFunction:
     @property
     def kind(self) -> str:
         return "uc_function"
+
+    @property
+    def required_user_scopes(self) -> frozenset[str]:
+        return _NO_USER_SCOPES
 
 
 Integration: TypeAlias = Sandbox | MCPService | UCFunction

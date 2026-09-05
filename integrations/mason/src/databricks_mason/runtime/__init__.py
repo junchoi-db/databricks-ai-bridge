@@ -1,9 +1,10 @@
 """Framework-neutral runtime helpers for an agent deployed on Databricks (via ``databricks-mason[runtime]``).
 
-These have no agent-framework dependency — MLflow tracing setup and workspace-routed SDK client
-construction — so they work regardless of which framework an agent is built with. Framework-specific
-helpers (session-store checkpointer, MCP tools, memory tools) live in the per-framework adapter
-package, e.g. :mod:`databricks_mason.langgraph`, which re-exports these for a single import point.
+These have no agent-framework dependency — request-scoped authorization, MLflow tracing setup, and
+workspace-routed SDK client construction — so they work regardless of which framework an agent is
+built with. Framework-specific helpers (session-store checkpointer, MCP tools, memory tools) live in
+the per-framework adapter package, e.g. :mod:`databricks_mason.langgraph`, which re-exports these for
+a single import point.
 
 ``__all__`` is the supported surface. ``session_store_client`` and ``background``
 are internal and reachable by their submodule paths but not re-exported here.
@@ -15,6 +16,22 @@ The re-exports below are resolved lazily (PEP 562) so importing a neutral submod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from databricks_mason.runtime.auth import (
+        InvocationAuthPolicy,
+        RequestAuthContext,
+        is_deployed_app,
+    )
+    from databricks_mason.runtime.errors import (
+        InvalidAppAuthorization,
+        InvalidUserAuthorization,
+        MasonRuntimeError,
+        MCPAuthorizationRequired,
+        MCPPermissionDenied,
+        MissingUserAuthorization,
+        RequestAuthorizationError,
+        UserAuthBackgroundUnsupported,
+        UserAuthHITLUnsupported,
+    )
     from databricks_mason.runtime.tracing import configure_tracing, tag_session
     from databricks_mason.runtime.workspace import workspace_client, workspace_headers
 
@@ -23,12 +40,37 @@ __all__ = [
     # a framework adapter that binds it).
     "configure_tracing",
     "tag_session",
+    # Explicit request-user authorization capability and invocation lifetime policy.
+    "RequestAuthContext",
+    "InvocationAuthPolicy",
+    "is_deployed_app",
+    "MissingUserAuthorization",
+    "RequestAuthorizationError",
+    "InvalidUserAuthorization",
+    "InvalidAppAuthorization",
+    "MCPPermissionDenied",
+    "UserAuthBackgroundUnsupported",
+    "UserAuthHITLUnsupported",
+    "MCPAuthorizationRequired",
+    "MasonRuntimeError",
     # Workspace SDK client construction (account-host / run-local routing handled).
     "workspace_client",
     "workspace_headers",
 ]
 
 _MODULE_BY_NAME = {
+    "RequestAuthContext": "auth",
+    "InvocationAuthPolicy": "auth",
+    "is_deployed_app": "auth",
+    "MissingUserAuthorization": "errors",
+    "RequestAuthorizationError": "errors",
+    "InvalidUserAuthorization": "errors",
+    "InvalidAppAuthorization": "errors",
+    "MCPPermissionDenied": "errors",
+    "UserAuthBackgroundUnsupported": "errors",
+    "UserAuthHITLUnsupported": "errors",
+    "MCPAuthorizationRequired": "errors",
+    "MasonRuntimeError": "errors",
     "configure_tracing": "tracing",
     "tag_session": "tracing",
     "workspace_client": "workspace",

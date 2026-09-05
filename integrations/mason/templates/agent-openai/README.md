@@ -209,7 +209,10 @@ curl -s -b "$COOKIE_JAR" -X POST "$BASE/invocations" -H "Content-Type: applicati
 - **Add a tool:** drop a new file in `agent/tools/` with a `@function_tool`-decorated function; it's
   collected automatically (see `agent/tools/sample_tool.py`). No wiring to edit.
 - **Add a Databricks integration:** run `mason tools add sandbox`, `mcp`, or `uc-function`; Mason
-  updates `agent/databricks_tools.py`, which is bound in `stream_handler()`.
+  updates `agent/databricks_tools.py`, which is bound in `stream_handler()`. Choose
+  `--auth user|app` when adding Sandbox or MCP; both default to request-user auth. `app` is the
+  dedicated App service principal, never the creator. UC Function and custom servers from
+  `build_mcp_servers()` keep their existing credentials.
 - **Require approval for a tool:** add `needs_approval=True` to the tool and its name to
   `REQUIRE_APPROVAL` in `agent/agent.py` (see the human-in-the-loop section above); empty the set to
   disable gating.
@@ -246,6 +249,16 @@ deploys the App.
 
 `app.yaml` carries the app's start command and env. By default the deployed app is the same lean
 backend: in-process session state, tracing off.
+
+For `auth="user"` Sandbox or managed MCP tools, Mason configures the App's `ai-gateway` user API
+scope and the runtime uses the Apps-forwarded caller credential. Browser/workspace callers may need
+to leave and re-enter the App and consent again after that scope changes; external OAuth callers
+must refresh a token covering the App's scopes. Missing or invalid scoped user auth fails closed and
+never falls back to the App service principal. User-auth tools are foreground-only, and phase-1
+OpenAI human-in-the-loop pauses are unsupported for them; use an App-only registry for background
+or pausable workload execution.
+During local development, `auth="app"` uses the selected profile; only a deployed Databricks App
+has the dedicated App service principal and its grants.
 
 ### Enable MLflow tracing (optional)
 

@@ -1,11 +1,12 @@
 import logging
 import os
 from collections.abc import AsyncGenerator
-from contextlib import AsyncExitStack
-from typing import Any
+from contextlib import AsyncExitStack, aclosing
+from typing import Any, cast
 
 from agents import Agent, Runner, RunResultStreaming, RunState
 from agents.items import ToolApprovalItem
+from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 from databricks_openai import AsyncDatabricksOpenAI
 from openai.types.responses import ResponseTextDeltaEvent
 
@@ -16,10 +17,16 @@ from agent.mcps import build_mcp_servers
 from agent.tools import all_tools
 from databricks_mason import tag_session, workspace_client
 from databricks_mason.openai import bind_tools, configure_tracing, memory_tools, session_store
+from databricks_mason.runtime import (
+    InvocationAuthPolicy,
+    RequestAuthContext,
+    UserAuthHITLUnsupported,
+)
 
 logger = logging.getLogger(__name__)
 
 MODEL = "databricks-gpt-5-2"
+AUTH_POLICY = InvocationAuthPolicy.from_integrations(DATABRICKS_TOOLS)
 
 # Tools that require human approval before they run. Add a tool's name here and the agent pauses when
 # the model calls it, emitting an `interrupt` event; the client resumes by sending `resume` with the
@@ -27,10 +34,11 @@ MODEL = "databricks-gpt-5-2"
 # how the runtime knows which pending calls to surface. Empty it to disable approval gating.
 REQUIRE_APPROVAL = {"send_message"}
 
-# Paused runs awaiting human approval, keyed by session id. In-process only — a paused run does NOT
-# survive a restart or reach another replica, even with AGENT_SESSION_STORE set: unlike a LangGraph
-# checkpoint, an Agents SDK Session persists the transcript but not paused RunState. Durable HITL
-# would stash RunState.to_json() separately; this template keeps it simple and in-memory.
+# Paused runs awaiting human approval, keyed by principal-bound state session id. In-process only —
+# a paused run does NOT survive a restart or reach another replica, even with AGENT_SESSION_STORE
+# set: unlike a LangGraph checkpoint, an Agents SDK Session persists the transcript but not paused
+# RunState. Durable HITL would stash RunState.to_json() separately; this template keeps it simple and
+# in-memory for App-authenticated integrations.
 _pending_runs: dict[str, RunState] = {}
 
 
@@ -90,7 +98,7 @@ def _session_id(request: dict) -> str:
     return str(request["session_id"])
 
 
-async def invoke_handler(request: dict) -> dict:
+async def invoke_handler(request: dict, request_auth: RequestAuthContext) -> dict:
     """Run one turn to completion. Called by the runtime for POST /invocations.
 
     ``request`` is a dict with an ``input`` list of Responses message dicts; the returned dict carries
@@ -100,11 +108,8 @@ async def invoke_handler(request: dict) -> dict:
     payload.
     """
     request = {**request, "session_id": _session_id(request)}
-    outputs = [
-        event
-        async for event in stream_handler(request)
-        if event.get("type") in ("message", "interrupt")
-    ]
+    async with aclosing(stream_handler(request, request_auth)) as stream:
+        outputs = [event async for event in stream if event.get("type") in ("message", "interrupt")]
     interrupted = bool(outputs and outputs[-1].get("type") == "interrupt")
     return {
         "output": [e["message"] if e["type"] == "message" else e for e in outputs],
@@ -113,10 +118,13 @@ async def invoke_handler(request: dict) -> dict:
     }
 
 
-async def stream_handler(request: dict) -> AsyncGenerator[dict, None]:
+async def stream_handler(
+    request: dict, request_auth: RequestAuthContext
+) -> AsyncGenerator[dict, None]:
     """Stream the agent's run events as JSON dicts. Called by the runtime when stream=true."""
-    session_id = _session_id(request)
-    tag_session(session_id)
+    routing_session = _session_id(request)
+    state_session_id = request_auth.state_key(routing_session)
+    tag_session(routing_session)
 
     # The agent runs inside an AsyncExitStack so any MCP servers stay connected for the whole run —
     # the Agents SDK lists each server's tools lazily inside Runner.run.
@@ -125,26 +133,34 @@ async def stream_handler(request: dict) -> AsyncGenerator[dict, None]:
         # selected in agent/databricks_tools.py. The stack owns every connection for this run.
         mcp = [await stack.enter_async_context(server) for server in build_mcp_servers()]
         agent = create_agent(mcp)
-        agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack)
+        agent = await bind_tools(
+            agent,
+            DATABRICKS_TOOLS,
+            stack=stack,
+            workspace_client_for=request_auth.client_for,
+        )
 
         # A `resume` payload continues a session paused awaiting approval; otherwise start a new turn
         # from `input`. A resumed run re-runs the stashed RunState (with decisions applied); a new
         # turn passes the messages plus the session store so prior history is loaded automatically.
         resume = request.get("resume")
         if resume is not None:
-            run_input: Any = _apply_decisions(session_id, resume)
+            run_input: Any = _apply_decisions(state_session_id, resume)
             result = Runner.run_streamed(agent, run_input)
         else:
             result = Runner.run_streamed(
-                agent, request.get("input") or [], session=session_store(session_id)
+                agent,
+                request.get("input") or [],
+                session=session_store(state_session_id),
             )
 
-        async for event in _serialize_events(result, session_id):
-            yield event
+        async with aclosing(_serialize_events(result, state_session_id)) as stream:
+            async for event in stream:
+                yield event
 
 
 def _apply_decisions(session_id: str, resume: dict) -> RunState:
-    """Apply human decisions to the session's paused run and return the RunState to re-run.
+    """Apply human decisions to the principal-bound session's paused run and return its RunState.
 
     ``resume`` mirrors the LangGraph contract: ``{"decisions": [{"type": "approve"|"reject", ...}]}``,
     one decision per pending approval, in interruption order. Raises if no paused run is loaded for
@@ -176,18 +192,29 @@ async def _serialize_events(
     Message dicts are normalized to ``{role, content, tool_calls?}`` regardless of the SDK's native
     item type.
     """
-    async for event in result.stream_events():
-        if event.type == "raw_response_event":
-            if isinstance(event.data, ResponseTextDeltaEvent) and event.data.delta:
-                yield {"type": "delta", "content": event.data.delta, "id": event.data.item_id}
-        elif event.type == "run_item_stream_event":
-            if message := _normalize_item(event.item):
-                yield {"type": "message", "message": message}
+    events = cast(AsyncGenerator[Any, None], result.stream_events())
+    async with aclosing(events):
+        async for event in events:
+            if event.type == "raw_response_event":
+                raw_event = cast(RawResponsesStreamEvent, event)
+                if isinstance(raw_event.data, ResponseTextDeltaEvent) and raw_event.data.delta:
+                    yield {
+                        "type": "delta",
+                        "content": raw_event.data.delta,
+                        "id": raw_event.data.item_id,
+                    }
+            elif event.type == "run_item_stream_event":
+                item_event = cast(RunItemStreamEvent, event)
+                if message := _normalize_item(item_event.item):
+                    yield {"type": "message", "message": message}
 
     # After the stream drains, a paused run surfaces as pending interruptions. Stash the RunState
     # (in-process) so a later resume can apply the decisions, and relay each pending call as an
-    # interrupt event on the session's thread.
+    # interrupt event on the principal-bound session's thread. User-authenticated runs cannot retain
+    # a live RunState because it closes over the request's agent and MCP clients.
     if result.interruptions:
+        if AUTH_POLICY.requires_user_credentials:
+            raise UserAuthHITLUnsupported()
         _pending_runs[session_id] = result.to_state()
         for item in result.interruptions:
             yield {"type": "interrupt", "id": item.call_id, "value": _approval_value(item)}

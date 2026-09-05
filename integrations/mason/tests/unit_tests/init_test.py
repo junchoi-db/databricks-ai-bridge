@@ -27,6 +27,17 @@ class _Ctx:
         self.profile = profile
 
 
+def _write_runtime_contract(target: pathlib.Path, source: str = "1") -> None:
+    runtime = target / "runtime" / "runtime.py"
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_text(f"REQUEST_AUTH_CONTRACT_VERSION = {source}\n")
+
+
+def _fetch_current_template(repo, ref, template_path, target, overlay_dirs=()):
+    del repo, ref, template_path, overlay_dirs
+    _write_runtime_contract(target)
+
+
 def test_framework_specs_have_repo_ref_path():
     for fw in ("openai", "langgraph"):
         spec = init_mod._TEMPLATES[fw]
@@ -44,17 +55,27 @@ def test_framework_specs_have_repo_ref_path():
 
 def test_template_ref_pins_versioned_template_to_release_tag(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(init_mod, "_installed_version", lambda _: "0.3.0")
+    monkeypatch.setattr(init_mod, "_is_direct_url_install", lambda: False, raising=False)
     # A released CLI fetches each versioned template tagged for its own version.
     assert init_mod._template_ref("langgraph") == "databricks-mason-v0.3.0"
     assert init_mod._template_ref("openai") == "databricks-mason-v0.3.0"
 
 
-@pytest.mark.parametrize("installed", ["0.1.0.dev0", "0.2.0+local"])
-def test_template_ref_falls_back_to_main_for_unreleased_builds(
+def test_template_ref_pins_published_dev_release_to_its_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(init_mod, "_installed_version", lambda _: "0.1.2.dev0")
+    monkeypatch.setattr(init_mod, "_is_direct_url_install", lambda: False, raising=False)
+
+    assert init_mod._template_ref("langgraph") == "databricks-mason-v0.1.2.dev0"
+
+
+@pytest.mark.parametrize("installed", ["0.1.2.dev0", "0.2.0+local"])
+def test_template_ref_falls_back_to_main_for_direct_or_local_builds(
     installed: str, monkeypatch: pytest.MonkeyPatch
-):
-    # Dev/editable/local-version builds have no matching release tag, so fetch `main`.
+) -> None:
     monkeypatch.setattr(init_mod, "_installed_version", lambda _: installed)
+    monkeypatch.setattr(init_mod, "_is_direct_url_install", lambda: True, raising=False)
     assert init_mod._template_ref("langgraph") == "main"
 
 
@@ -64,6 +85,56 @@ def test_template_ref_falls_back_when_package_not_installed(monkeypatch: pytest.
 
     monkeypatch.setattr(init_mod, "_installed_version", _raise)
     assert init_mod._template_ref("langgraph") == "main"
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "expected"), [(None, False), ('{"url":"file:///tmp"}', True)]
+)
+def test_direct_url_install_detection(
+    monkeypatch: pytest.MonkeyPatch, direct_url: str | None, expected: bool
+) -> None:
+    distribution = mock.Mock()
+    distribution.read_text.return_value = direct_url
+    monkeypatch.setattr(init_mod, "_installed_distribution", lambda _: distribution)
+
+    assert init_mod._is_direct_url_install() is expected
+    distribution.read_text.assert_called_once_with("direct_url.json")
+
+
+@pytest.mark.parametrize(
+    ("framework", "extra"),
+    [("langgraph", "runtime"), ("openai", "runtime-openai")],
+)
+def test_init_pins_generated_runtime_to_the_exact_published_cli_version(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+    extra: str,
+) -> None:
+    dest = tmp_path / framework
+
+    def fake_fetch(repo, ref, template_path, target, overlay_dirs=()):
+        del repo, ref, template_path, overlay_dirs
+        _write_runtime_contract(target)
+        (target / "pyproject.toml").write_text(
+            f'[project]\ndependencies = ["databricks-mason[{extra}]>=0.1.1.dev0"]\n',
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(init_mod, "_installed_version", lambda _: "0.4.0.dev0")
+    monkeypatch.setattr(init_mod, "_is_direct_url_install", lambda: False, raising=False)
+    monkeypatch.setattr(init_mod, "_fetch_template", fake_fetch)
+
+    result = CliRunner().invoke(
+        init_mod.init,
+        ["--framework", framework, str(dest)],
+        obj=_Ctx(),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f'"databricks-mason[{extra}]==0.4.0.dev0"' in (dest / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_init_scaffolds_default_directory(tmp_path: pathlib.Path):
@@ -96,7 +167,7 @@ def test_init_defaults_to_langgraph_framework(tmp_path: pathlib.Path):
 def test_init_persists_selected_framework_and_template(tmp_path: pathlib.Path):
     dest = tmp_path / "proj"
 
-    with mock.patch.object(init_mod, "_fetch_template", side_effect=lambda *a: a[3].mkdir()):
+    with mock.patch.object(init_mod, "_fetch_template", side_effect=_fetch_current_template):
         result = CliRunner().invoke(
             init_mod.init,
             ["--framework", "langgraph", str(dest)],
@@ -110,6 +181,8 @@ def test_init_persists_selected_framework_and_template(tmp_path: pathlib.Path):
         "schema_version": 1,
         "framework": "langgraph",
         "template": "agent-langgraph",
+        "request_auth_contract_version": 1,
+        "extra_user_api_scopes": [],
     }
 
 
@@ -298,7 +371,7 @@ def test_init_disable_chat_app_omits_openai_overlay(tmp_path: pathlib.Path):
 
 def test_init_json_output(tmp_path: pathlib.Path):
     dest = tmp_path / "proj"
-    with mock.patch.object(init_mod, "_fetch_template", side_effect=lambda *a: a[3].mkdir()):
+    with mock.patch.object(init_mod, "_fetch_template", side_effect=_fetch_current_template):
         result = CliRunner().invoke(
             init_mod.init, ["--framework", "langgraph", str(dest)], obj=_Ctx(output="json")
         )
@@ -308,6 +381,68 @@ def test_init_json_output(tmp_path: pathlib.Path):
     assert payload["template"] == "agent-langgraph"
     assert payload["directory"] == str(dest)
     assert payload["chat_app_enabled"] is True
+    assert payload["request_auth_contract_version"] == 1
+    assert payload["extra_user_api_scopes"] == []
+
+
+def test_init_custom_template_without_static_marker_omits_request_auth_contract(
+    tmp_path: pathlib.Path,
+) -> None:
+    dest = tmp_path / "custom"
+
+    with mock.patch.object(init_mod, "_fetch_template", side_effect=lambda *a: a[3].mkdir()):
+        result = CliRunner().invoke(
+            init_mod.init,
+            [
+                "--framework",
+                "langgraph",
+                "--repo",
+                "https://example.com/custom.git",
+                "--ref",
+                "old-runtime",
+                str(dest),
+            ],
+            obj=_Ctx(output="json"),
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["request_auth_contract_version"] is None
+    with (dest / ".mason" / "project.toml").open("rb") as metadata_file:
+        metadata = tomli.load(metadata_file)
+    assert "request_auth_contract_version" not in metadata
+
+
+def test_template_contract_marker_is_read_without_executing_runtime(tmp_path: pathlib.Path) -> None:
+    _write_runtime_contract(tmp_path, "1\nraise RuntimeError('must not execute')")
+
+    assert init_mod._template_request_auth_contract_version(tmp_path) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "True",
+        "2",
+        "int('1')",
+        "1\nREQUEST_AUTH_CONTRACT_VERSION = 1",
+    ],
+)
+def test_template_contract_marker_rejects_untrusted_forms(
+    tmp_path: pathlib.Path, source: str
+) -> None:
+    _write_runtime_contract(tmp_path, source)
+
+    assert init_mod._template_request_auth_contract_version(tmp_path) is None
+
+
+@pytest.mark.parametrize("framework", ["langgraph", "openai"])
+def test_checked_in_template_runtime_declares_supported_request_auth_contract(
+    framework: str,
+) -> None:
+    template = pathlib.Path(__file__).parents[2] / "templates" / f"agent-{framework}"
+
+    assert init_mod._template_request_auth_contract_version(template) == 1
 
 
 def test_init_refuses_existing_destination(tmp_path: pathlib.Path):

@@ -14,7 +14,12 @@ integration binding, session storage, long-term memory tools, and MLflow tracing
             model="databricks-gpt-5-2",
             tools=[*your_tools, *memory_tools()],
         )
-        agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack)
+        agent = await bind_tools(
+            agent,
+            DATABRICKS_TOOLS,
+            stack=stack,
+            workspace_client_for=request_auth.client_for,
+        )
         result = await Runner.run(agent, messages, session=session_store(session_id))
 
 ``__all__`` is the curated surface. Other entry points (``DatabricksSessionStore``) are

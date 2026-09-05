@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import pathlib
 import types
+from typing import Any, cast
 from unittest import mock
 
+import pytest
 import yaml
 from click.testing import CliRunner
+from databricks.sdk.errors import NotFound
+from databricks.sdk.service.apps import App
 
 from databricks_mason import deploy as deploy_mod
+from databricks_mason.client import MasonClient
 from databricks_mason.errors import AgentCliError
+from databricks_mason.integration_codegen import render_registry
+from databricks_mason.integrations import MCPService, Sandbox, Scope, UCFunction
+
+
+def _separate_stderr_runner() -> CliRunner:
+    if "mix_stderr" in inspect.signature(CliRunner).parameters:
+        return cast(Any, CliRunner)(mix_stderr=False)
+    return CliRunner()
 
 
 def test_upsert_manifest_env_scaffolds_when_missing(tmp_path: pathlib.Path):
@@ -121,7 +135,9 @@ def test_deploy_sync_keeps_code_selected_tool_registry(tmp_path: pathlib.Path, m
     (src / "app.yaml").write_text(yaml.safe_dump({"command": ["x"]}))
     registry = src / "agent" / "databricks_tools.py"
     registry.parent.mkdir()
-    registry.write_text("DATABRICKS_TOOLS = ()\n")
+    registry.write_text(render_registry([]))
+    original_registry = registry.read_text()
+    client = _ScopeClient([_app([])])
     calls: list[list[str]] = []
     monkeypatch.setattr(deploy_mod, "_deployment_exists", lambda a, p: True)
     monkeypatch.setattr(
@@ -131,7 +147,11 @@ def test_deploy_sync_keeps_code_selected_tool_registry(tmp_path: pathlib.Path, m
         or types.SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
 
-    result = CliRunner().invoke(deploy_mod.deploy, ["myapp", "--source", str(src)], obj=_FakeCtx())
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(src)],
+        obj=_ScopeCtx(client),
+    )
 
     assert result.exit_code == 0, result.output
     sync = next(args for args in calls if args[0] == "sync")
@@ -142,7 +162,7 @@ def test_deploy_sync_keeps_code_selected_tool_registry(tmp_path: pathlib.Path, m
     ]
     excluded = {sync[index + 1] for index, value in enumerate(sync[:-1]) if value == "--exclude"}
     assert "agent/databricks_tools.py" not in excluded
-    assert registry.read_text() == "DATABRICKS_TOOLS = ()\n"
+    assert registry.read_text() == original_registry
 
 
 def test_first_deploy_waits_for_running_before_deploying(tmp_path: pathlib.Path, monkeypatch):
@@ -481,3 +501,767 @@ def test_lifecycle_commands_honor_json_output(monkeypatch):
         result = CliRunner().invoke(command, args, obj=_JsonCtx())
         assert result.exit_code == 0, result.output
         assert json.loads(result.output) == {key: "myapp"}
+
+
+def _app(requested: list[str], effective: list[str] | None = None, *, name: str = "myapp") -> App:
+    return App(
+        name=name,
+        user_api_scopes=requested,
+        effective_user_api_scopes=requested if effective is None else effective,
+    )
+
+
+class _ScopeClient(_FakeClient):
+    def __init__(self, reads: list[App | AgentCliError]):
+        self._reads = list(reads)
+        self.get_app_calls: list[str] = []
+        self.create_app_calls: list[tuple[str, list[str]]] = []
+        self.update_app_calls: list[tuple[str, list[str]]] = []
+        self.created_stores: list[str] = []
+
+    def _next_read(self) -> App:
+        value = self._reads.pop(0) if len(self._reads) > 1 else self._reads[0]
+        if isinstance(value, AgentCliError):
+            raise value
+        return value
+
+    def get_app(self, name: str) -> App:
+        self.get_app_calls.append(name)
+        return self._next_read()
+
+    def create_app(self, name: str, user_api_scopes: list[str]) -> App:
+        self.create_app_calls.append((name, list(user_api_scopes)))
+        return _app(list(user_api_scopes), [], name=name)
+
+    def update_app(self, name: str, user_api_scopes: list[str]) -> App:
+        self.update_app_calls.append((name, list(user_api_scopes)))
+        return _app(list(user_api_scopes), [], name=name)
+
+    def create_memory_store(self, display_name):
+        self.created_stores.append(display_name)
+        return super().create_memory_store(display_name)
+
+
+class _ScopeCtx:
+    profile = "prof"
+
+    def __init__(self, client: _ScopeClient, output: str = "text"):
+        self._client = client
+        self.output = output
+
+    def client(self):
+        return self._client
+
+
+def _write_mason_source(
+    root: pathlib.Path,
+    integrations,
+    *,
+    contract_version: int | None = 1,
+    extra_scopes: tuple[str, ...] = (),
+) -> pathlib.Path:
+    source = root / "mason-app"
+    source.mkdir()
+    (source / "app.yaml").write_text(yaml.safe_dump({"command": ["x"]}))
+    metadata = source / ".mason" / "project.toml"
+    metadata.parent.mkdir()
+    contract = (
+        f"request_auth_contract_version = {contract_version}\n"
+        if contract_version is not None
+        else ""
+    )
+    metadata.write_text(
+        'schema_version = 1\nframework = "langgraph"\ntemplate = "agent-langgraph"\n'
+        f"{contract}extra_user_api_scopes = {json.dumps(list(extra_scopes))}\n"
+    )
+    registry = source / "agent" / "databricks_tools.py"
+    registry.parent.mkdir()
+    registry.write_text(render_registry(integrations))
+    return source
+
+
+def test_new_mason_app_includes_desired_scopes_in_initial_create() -> None:
+    client = _ScopeClient(
+        [
+            AgentCliError("missing", error_code="RESOURCE_DOES_NOT_EXIST"),
+            _app(["ai-gateway", "sql"], ["ai-gateway", "openid", "sql"]),
+        ]
+    )
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway", "sql"),
+        confirm_removal=False,
+        poll_timeout_s=0,
+        poll_interval_s=0,
+    )
+
+    assert client.create_app_calls == [("myapp", ["ai-gateway", "sql"])]
+    assert client.update_app_calls == []
+    assert state.created is True
+    assert state.changed is True
+    assert state.requested_scopes == ("ai-gateway", "sql")
+    assert state.effective_scopes == ("ai-gateway", "openid", "sql")
+
+
+def test_new_mason_app_waits_for_requested_scopes_to_become_visible() -> None:
+    client = _ScopeClient(
+        [
+            AgentCliError("missing", error_code="RESOURCE_DOES_NOT_EXIST"),
+            _app([], []),
+            _app(["ai-gateway"], ["ai-gateway", "openid"]),
+        ]
+    )
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway",),
+        confirm_removal=False,
+        poll_timeout_s=1,
+        poll_interval_s=0,
+    )
+
+    assert client.create_app_calls == [("myapp", ["ai-gateway"])]
+    assert state.requested_scopes == ("ai-gateway",)
+    assert state.effective_scopes == ("ai-gateway", "openid")
+
+
+def test_existing_mason_app_with_exact_scopes_is_idempotent() -> None:
+    client = _ScopeClient([_app(["ai-gateway"], ["ai-gateway", "openid"])])
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway",),
+        confirm_removal=False,
+        poll_timeout_s=0,
+        poll_interval_s=0,
+    )
+
+    assert client.create_app_calls == []
+    assert client.update_app_calls == []
+    assert state.changed is False
+    assert state.requested_scopes == ("ai-gateway",)
+
+
+def test_existing_mason_app_adds_desired_scopes_exactly() -> None:
+    client = _ScopeClient(
+        [
+            _app(["sql"]),
+            _app(["sql"]),
+            _app(["ai-gateway", "sql"], ["ai-gateway", "openid", "sql"]),
+        ]
+    )
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway", "sql"),
+        confirm_removal=False,
+        poll_timeout_s=0,
+        poll_interval_s=0,
+    )
+
+    assert client.update_app_calls == [("myapp", ["ai-gateway", "sql"])]
+    assert state.changed is True
+
+
+def test_existing_mason_app_waits_for_updated_scopes_to_become_visible() -> None:
+    client = _ScopeClient(
+        [
+            _app([]),
+            _app([]),
+            _app([], []),
+            _app(["ai-gateway"], ["ai-gateway", "openid"]),
+        ]
+    )
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway",),
+        confirm_removal=False,
+        poll_timeout_s=1,
+        poll_interval_s=0,
+    )
+
+    assert client.update_app_calls == [("myapp", ["ai-gateway"])]
+    assert state.requested_scopes == ("ai-gateway",)
+    assert state.effective_scopes == ("ai-gateway", "openid")
+
+
+def test_existing_unknown_scope_requires_explicit_adoption_or_removal() -> None:
+    client = _ScopeClient([_app(["ai-gateway"])])
+
+    with pytest.raises(AgentCliError) as exc_info:
+        deploy_mod._reconcile_user_api_scopes(
+            client,
+            "myapp",
+            (),
+            confirm_removal=False,
+            poll_timeout_s=0,
+            poll_interval_s=0,
+        )
+
+    rendered = f"{exc_info.value} {exc_info.value.hint}"
+    assert "ai-gateway" in rendered
+    assert "extra_user_api_scopes" in rendered
+    assert "--confirm-user-scope-removal" in rendered
+    assert client.update_app_calls == []
+
+
+def test_confirm_user_scope_removal_authorizes_exact_stale_scope_removal() -> None:
+    client = _ScopeClient([_app(["ai-gateway"]), _app(["ai-gateway"]), _app([])])
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        (),
+        confirm_removal=True,
+        poll_timeout_s=0,
+        poll_interval_s=0,
+    )
+
+    assert client.update_app_calls == [("myapp", [])]
+    assert state.requested_scopes == ()
+    assert state.changed is True
+
+
+def test_scope_reconciliation_detects_drift_immediately_before_update() -> None:
+    client = _ScopeClient([_app([]), _app(["sql"])])
+
+    with pytest.raises(AgentCliError, match="concurrent"):
+        deploy_mod._reconcile_user_api_scopes(
+            client,
+            "myapp",
+            ("ai-gateway",),
+            confirm_removal=False,
+            poll_timeout_s=0,
+            poll_interval_s=0,
+        )
+
+    assert client.update_app_calls == []
+
+
+def test_scope_reconciliation_detects_requested_drift_after_update() -> None:
+    client = _ScopeClient([_app([]), _app([]), _app(["sql"], ["sql"])])
+
+    with pytest.raises(AgentCliError, match="concurrent"):
+        deploy_mod._reconcile_user_api_scopes(
+            client,
+            "myapp",
+            ("ai-gateway",),
+            confirm_removal=False,
+            poll_timeout_s=0,
+            poll_interval_s=0,
+        )
+
+    assert client.update_app_calls == [("myapp", ["ai-gateway"])]
+
+
+def test_requested_scope_propagation_timeout_is_not_reported_as_concurrent() -> None:
+    client = _ScopeClient(
+        [
+            AgentCliError("missing", error_code="RESOURCE_DOES_NOT_EXIST"),
+            _app([], []),
+        ]
+    )
+
+    with pytest.raises(AgentCliError) as exc_info:
+        deploy_mod._reconcile_user_api_scopes(
+            client,
+            "myapp",
+            ("ai-gateway",),
+            confirm_removal=False,
+            poll_timeout_s=0,
+            poll_interval_s=0,
+        )
+
+    assert "requested user API scopes" in str(exc_info.value)
+    assert "visible" in str(exc_info.value)
+    assert "concurrent" not in str(exc_info.value)
+
+
+def test_scope_reconciliation_times_out_before_required_scopes_are_effective() -> None:
+    client = _ScopeClient([_app(["ai-gateway"], [])])
+
+    with pytest.raises(AgentCliError, match="effective"):
+        deploy_mod._reconcile_user_api_scopes(
+            client,
+            "myapp",
+            ("ai-gateway",),
+            confirm_removal=False,
+            poll_timeout_s=0,
+            poll_interval_s=0,
+        )
+
+
+class _PreflightCtx:
+    profile = "prof"
+    output = "text"
+
+    def __init__(self):
+        self.client_calls = 0
+
+    def client(self):
+        self.client_calls += 1
+        raise AssertionError("preflight must fail before constructing a client")
+
+
+def test_deploy_rejects_legacy_missing_auth_with_exact_registry_edits(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="web", service="system.ai.web_search", auth="user")],
+    )
+    registry = source / "agent" / "databricks_tools.py"
+    registry.write_text(registry.read_text().replace('        auth="user",\n', ""))
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: cli_calls.append(args),
+    )
+    ctx = _PreflightCtx()
+
+    result = CliRunner().invoke(deploy_mod.deploy, ["myapp", "--source", str(source)], obj=ctx)
+
+    output = " ".join(result.output.split())
+    assert result.exit_code != 0
+    assert "web" in output
+    assert 'auth="user"' in output
+    assert 'auth="app"' in output
+    assert "databricks_tools.py" in "".join(result.output.split())
+    assert ctx.client_calls == 0
+    assert cli_calls == []
+
+
+def test_deploy_rejects_user_auth_with_legacy_request_handler_before_mutation(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="web", service="system.ai.web_search", auth="user")],
+        contract_version=None,
+    )
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: cli_calls.append(args),
+    )
+    ctx = _PreflightCtx()
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source), "--memory", "must-not-create"],
+        obj=ctx,
+    )
+
+    output = " ".join(result.output.split())
+    assert result.exit_code != 0
+    assert "request-auth" in output
+    assert "version 1" in output
+    assert ctx.client_calls == 0
+    assert cli_calls == []
+
+
+def test_deploy_rejects_declared_extra_scopes_without_request_handler_contract(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="app-mcp", service="system.ai.genie", auth="app")],
+        contract_version=None,
+        extra_scopes=("sql",),
+    )
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: cli_calls.append(args),
+    )
+    ctx = _PreflightCtx()
+
+    result = CliRunner().invoke(deploy_mod.deploy, ["myapp", "--source", str(source)], obj=ctx)
+
+    output = " ".join(result.output.split())
+    assert result.exit_code != 0
+    assert "request-auth" in output
+    assert "version 1" in output
+    assert "sql" in output
+    assert ctx.client_calls == 0
+    assert cli_calls == []
+
+
+def test_deploy_rejects_extra_only_scopes_without_a_user_auth_integration(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="app-mcp", service="system.ai.genie", auth="app")],
+        extra_scopes=("sql",),
+    )
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: cli_calls.append(args),
+    )
+    ctx = _PreflightCtx()
+
+    result = CliRunner().invoke(deploy_mod.deploy, ["myapp", "--source", str(source)], obj=ctx)
+
+    output = " ".join(result.output.split())
+    assert result.exit_code != 0
+    assert "extra_user_api_scopes" in output
+    assert 'auth="user"' in output
+    assert "contract version 1" in output
+    assert ctx.client_calls == 0
+    assert cli_calls == []
+
+
+def test_generic_byo_deploy_never_reads_or_mutates_user_scopes(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = tmp_path / "byo"
+    source.mkdir()
+    (source / "app.yaml").write_text(yaml.safe_dump({"command": ["x"]}))
+
+    class _ByoClient(_FakeClient):
+        def get_app(self, name):
+            raise AssertionError("generic/BYO deploy must not read Apps scopes")
+
+        def create_app(self, name, user_api_scopes):
+            raise AssertionError("generic/BYO deploy must not create through scope reconciliation")
+
+        def update_app(self, name, user_api_scopes):
+            raise AssertionError("generic/BYO deploy must not mutate Apps scopes")
+
+    class _ByoCtx(_FakeCtx):
+        def client(self):
+            return _ByoClient()
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(deploy_mod, "_deployment_exists", lambda name, profile: True)
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: calls.append(args)
+        or types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy, ["myapp", "--source", str(source)], obj=_ByoCtx()
+    )
+
+    assert result.exit_code == 0, result.output
+    assert any(call[0] == "sync" for call in calls)
+    assert any(call[:3] == ["apps", "deploy", "myapp"] for call in calls)
+
+
+def test_mason_deploy_derives_sorted_scope_union_and_safe_json_auth_output(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [
+            MCPService(id="user-mcp", service="system.ai.web_search", auth="user"),
+            MCPService(id="app-mcp", service="system.ai.genie", auth="app"),
+            Sandbox(
+                id="app-sandbox",
+                scopes=(Scope.table("main.tools.items"),),
+                auth="app",
+            ),
+            UCFunction(id="function", function="main.tools.lookup"),
+        ],
+        extra_scopes=("sql",),
+    )
+    client = _ScopeClient(
+        [
+            _app(["sql"]),
+            _app(["sql"]),
+            _app(["ai-gateway", "sql"], ["openid", "sql", "ai-gateway"]),
+        ]
+    )
+    ctx = _ScopeCtx(client, output="json")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(deploy_mod, "_deployment_exists", lambda name, profile: True)
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: calls.append(args)
+        or types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = _separate_stderr_runner().invoke(
+        deploy_mod.deploy, ["myapp", "--source", str(source)], obj=ctx
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.update_app_calls == [("myapp", ["ai-gateway", "sql"])]
+    payload = json.loads(result.stdout)
+    assert payload["user_api_scopes"] == {
+        "desired": ["ai-gateway", "sql"],
+        "requested": ["ai-gateway", "sql"],
+        "effective": ["ai-gateway", "openid", "sql"],
+        "changed": True,
+    }
+    assert payload["app_auth_integration_ids"] == ["app-mcp", "app-sandbox"]
+    warnings = {warning["code"]: warning for warning in payload["warnings"]}
+    consent = warnings["USER_API_SCOPES_CHANGED"]
+    assert consent["reconsent_required"] is True
+    assert consent["token_remint_required"] is True
+    assert "re-consent" in consent["message"]
+    assert "remint" in consent["message"]
+    shared = warnings["APP_AUTH_SHARED_AUTHORITY"]
+    assert shared["integration_ids"] == ["app-mcp", "app-sandbox"]
+    assert 'auth="app"' in shared["message"]
+    assert "CAN USE" in shared["message"]
+    assert any(call[0] == "sync" for call in calls)
+
+
+def test_new_mason_deploy_uses_typed_create_then_existing_compute_wait(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="user-mcp", service="system.ai.web_search", auth="user")],
+    )
+    client = _ScopeClient(
+        [
+            AgentCliError("missing", error_code="RESOURCE_DOES_NOT_EXIST"),
+            _app(["ai-gateway"]),
+        ]
+    )
+    events: list[str] = []
+    cli_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_wait_for_running",
+        lambda name, profile: events.append("wait"),
+    )
+
+    def fake_databricks(args, profile, **kwargs):
+        events.append(args[0])
+        cli_calls.append(args)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        fake_databricks,
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source)],
+        obj=_ScopeCtx(client),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.create_app_calls == [("myapp", ["ai-gateway"])]
+    assert not any(value[:2] == ["apps", "create"] for value in cli_calls)
+    wait_index = events.index("wait")
+    sync_index = events.index("sync")
+    assert wait_index < sync_index
+
+
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_sdk_not_found_without_error_code_reaches_new_app_create(workspace_client) -> None:
+    instance = workspace_client.return_value
+    instance.config.host = "https://ws.example.com"
+    instance.config.workspace_id = None
+    instance.apps.get.side_effect = [NotFound("missing"), _app(["ai-gateway"])]
+    instance.apps.create.return_value = mock.Mock(response=_app(["ai-gateway"], [], name="myapp"))
+    client = MasonClient("prof")
+
+    state = deploy_mod._reconcile_user_api_scopes(
+        client,
+        "myapp",
+        ("ai-gateway",),
+        confirm_removal=False,
+        poll_timeout_s=0,
+        poll_interval_s=0,
+    )
+
+    assert state.created is True
+    request = instance.apps.create.call_args.args[0]
+    assert request.as_dict() == {"name": "myapp", "user_api_scopes": ["ai-gateway"]}
+
+
+def test_deploy_flag_authorizes_stale_ai_gateway_removal(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="app-mcp", service="system.ai.genie", auth="app")],
+    )
+    client = _ScopeClient([_app(["ai-gateway"]), _app(["ai-gateway"]), _app([])])
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        [
+            "myapp",
+            "--source",
+            str(source),
+            "--confirm-user-scope-removal",
+        ],
+        obj=_ScopeCtx(client),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert client.update_app_calls == [("myapp", [])]
+
+
+def test_app_only_legacy_contract_stays_app_auth_and_emits_shared_authority_warning(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [
+            MCPService(id="app-mcp", service="system.ai.genie", auth="app"),
+            Sandbox(
+                id="app-sandbox",
+                scopes=(Scope.volume("main.tools.files"),),
+                auth="app",
+            ),
+        ],
+        contract_version=None,
+    )
+    client = _ScopeClient([_app([])])
+    calls: list[list[str]] = []
+    monkeypatch.setattr(deploy_mod, "_deployment_exists", lambda name, profile: True)
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: calls.append(args)
+        or types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source)],
+        obj=_ScopeCtx(client),
+    )
+
+    output = " ".join(result.output.split())
+    assert result.exit_code == 0, result.output
+    assert client.update_app_calls == []
+    assert "CAN USE" in output
+    assert "app-mcp" in output
+    assert "app-sandbox" in output
+
+
+def test_scope_change_output_requires_reconsent_and_token_remint(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [
+            MCPService(id="user-mcp", service="system.ai.web_search", auth="user"),
+            MCPService(id="app-mcp", service="system.ai.genie", auth="app"),
+        ],
+    )
+    client = _ScopeClient([_app([]), _app([]), _app(["ai-gateway"])])
+    monkeypatch.setattr(deploy_mod, "_deployment_exists", lambda name, profile: True)
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source)],
+        obj=_ScopeCtx(client),
+    )
+
+    output = " ".join(result.output.split()).lower()
+    assert result.exit_code == 0, result.output
+    assert "re-consent" in output
+    assert "remint" in output
+    assert "can use" in output
+    assert "app-mcp" in output
+
+
+def test_json_scope_warnings_survive_failure_after_reconciliation(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [
+            MCPService(id="user-mcp", service="system.ai.web_search", auth="user"),
+            MCPService(id="app-mcp", service="system.ai.genie", auth="app"),
+        ],
+    )
+    client = _ScopeClient([_app([]), _app([]), _app(["ai-gateway"])])
+
+    def fail_sync(args, profile, **kwargs):
+        if args[0] == "sync":
+            raise AgentCliError("sync failed after scope reconciliation")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(deploy_mod, "_databricks", fail_sync)
+
+    result = _separate_stderr_runner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source)],
+        obj=_ScopeCtx(client, output="json"),
+    )
+
+    assert result.exit_code != 0
+    assert result.stdout == ""
+    warning_records = []
+    for line in result.stderr.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "warning" in record:
+            warning_records.append(record["warning"])
+    assert {warning["code"] for warning in warning_records} == {
+        "USER_API_SCOPES_CHANGED",
+        "APP_AUTH_SHARED_AUTHORITY",
+    }
+    assert "re-consent" in result.stderr
+    assert "remint" in result.stderr
+
+
+def test_scope_reconciliation_failure_happens_before_stores_sync_or_deploy(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    source = _write_mason_source(
+        tmp_path,
+        [MCPService(id="user-mcp", service="system.ai.web_search", auth="user")],
+    )
+    client = _ScopeClient([_app(["ai-gateway"], [])])
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy_mod,
+        "_reconcile_user_api_scopes",
+        mock.Mock(side_effect=AgentCliError("required user scopes are not effective")),
+    )
+    monkeypatch.setattr(
+        deploy_mod,
+        "_databricks",
+        lambda args, profile, **kwargs: calls.append(args),
+    )
+
+    result = CliRunner().invoke(
+        deploy_mod.deploy,
+        ["myapp", "--source", str(source), "--memory", "must-not-create"],
+        obj=_ScopeCtx(client),
+    )
+
+    assert result.exit_code != 0
+    assert client.created_stores == []
+    assert calls == []

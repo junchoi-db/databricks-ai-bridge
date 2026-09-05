@@ -129,7 +129,10 @@ def dev(
     if prepare_environment is None:
         prepare_environment = not (source_dir / ".venv").exists()
 
-    args = ["apps", "run-local"]
+    # Apps run-local injects the same DATABRICKS_APP_NAME sentinel as a deployment. Preserve that
+    # official Apps metadata while marking this process so request-user integrations resolve the
+    # selected local profile instead of expecting an ingress-forwarded Apps credential.
+    args = ["apps", "run-local", "--env", "DATABRICKS_MASON_RUN_LOCAL=1"]
     if prepare_environment:
         args.append("--prepare-environment")
     if app_port is not None:

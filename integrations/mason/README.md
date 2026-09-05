@@ -98,13 +98,14 @@ mason [-p <profile>] [-o text|json]
   mcp
     list             [--schema CATALOG.SCHEMA]
   tools
-    add sandbox      --scope SCOPE [--scope SCOPE ...] [--source PATH] [--framework F]
-    add mcp          SERVICE [--name NAME] [--source PATH] [--framework F]
+    add sandbox      --scope SCOPE [--scope SCOPE ...] [--auth user|app] [--source PATH] [--framework F]
+    add mcp          SERVICE [--name NAME] [--auth user|app] [--source PATH] [--framework F]
     add uc-function  FUNCTION [--name NAME] [--source PATH] [--framework F]
     list             [--source PATH] [--framework F]
   deploy       <name> --source PATH [--memory/-m N]
                [--session/-s N] [--actor-id ID]
                [--with-traces C.S] [--no-create-stores]
+               [--confirm-user-scope-removal]
   deployments  list | get | logs | start | stop | delete
 ```
 
@@ -141,11 +142,28 @@ change it prints the exact definition line and either the exact attachment line 
 framework snippet the user still needs to add:
 
 ```sh
-mason tools add sandbox --scope table:samples.nyctaxi.trips
-mason tools add mcp system.ai.web_search
+mason tools add sandbox --scope table:samples.nyctaxi.trips  # defaults to --auth user
+mason tools add mcp system.ai.web_search                     # defaults to --auth user
 mason tools add uc-function catalog.schema.lookup_ticket
 mason tools list
 ```
+
+Choose integration identity when the tool is added. `MCPService` and `Sandbox` default to
+`auth="user"`; Mason writes that choice explicitly and, for a deployed App, requests the
+`ai-gateway` user API scope so Apps can forward the caller's credential. After that scope is added
+or changed, browser/workspace callers may need to leave and re-enter the App and consent again;
+programmatic callers must refresh an OAuth token covering the App's requested scopes. A deployed
+user-auth integration without that scoped forwarded credential fails closed.
+
+Use `--auth app` only for deliberate workload identity. It means the dedicated Databricks App
+service principal, never the App creator. Every caller with App `CAN USE` can potentially exercise
+that principal's downstream grants, so restrict `CAN USE` accordingly or separate the App. User-auth
+integrations cannot run in background mode because the request credential must not outlive the
+request. Phase-1 OpenAI Agents SDK human-in-the-loop pauses are likewise unsupported with user-auth
+integrations. UC Function keeps its existing App/default credential path, and customer MCP servers
+from `build_mcp_servers()` keep their explicitly configured credentials.
+In `mason dev`, both modes use the selected local profile because no Databricks App service
+principal exists; local `auth="app"` therefore does not reproduce deployed App-SP permissions.
 
 Both Mason templates include an active construction seam. An empty registry is a credential-free
 no-op, so the source diff from `mason tools add` is the activation change. The LangGraph template
@@ -158,6 +176,7 @@ tools = [
     *await load_tools(
         DATABRICKS_TOOLS,
         extra_servers=build_mcp_servers(),
+        workspace_client_for=request_auth.client_for,
         existing_tools=local_tools,
     ),
 ]
@@ -167,7 +186,12 @@ The OpenAI template binds in its request-scoped streaming path, which is also us
 invocations. Its `AsyncExitStack` owns the MCP connections:
 
 ```python
-agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack)
+agent = await bind_tools(
+    agent,
+    DATABRICKS_TOOLS,
+    stack=stack,
+    workspace_client_for=request_auth.client_for,
+)
 ```
 
 For a bring-your-own agent, attach the generated registry once at the framework's agent-construction

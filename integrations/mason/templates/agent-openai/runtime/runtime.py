@@ -2,8 +2,8 @@
 
 ``build_app`` wires the endpoints to two handlers with a generic contract:
 
-    invoke_handler(request: dict) -> dict
-    stream_handler(request: dict) -> AsyncGenerator[dict]
+    invoke_handler(request: dict, request_auth: RequestAuthContext) -> dict
+    stream_handler(request: dict, request_auth: RequestAuthContext) -> AsyncGenerator[dict]
 
 Nothing here is SDK-specific — the agent lives entirely behind those handlers (``agent/agent.py``).
 The Databricks Apps ``__Host-databricks-app-router`` cookie is both the replica-affinity key and the
@@ -24,16 +24,27 @@ for tracing.
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 
 import mlflow
-from databricks_mason.runtime.background import BackgroundRuns
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from uuid_utils import uuid7
 
+from databricks_mason.runtime import (
+    InvocationAuthPolicy,
+    MasonRuntimeError,
+    RequestAuthContext,
+    UserAuthBackgroundUnsupported,
+)
+from databricks_mason.runtime.background import BackgroundRuns
+
+REQUEST_AUTH_CONTRACT_VERSION = 1
+
 # Request keys that control transport; stripped before the request reaches the handler.
 _REQUEST_STREAM_PARAM_KEY = "stream"
 _REQUEST_BACKGROUND_PARAM_KEY = "background"
+_FORWARDED_ACCESS_TOKEN_HEADER = "x-forwarded-access-token"
 _REQUEST_SESSION_ID_HEADER_KEY = (
     "X-Routing-Key"  # carries the session id (generic for Apps + Agents)
 )
@@ -43,8 +54,8 @@ _LOCAL_SESSION_COOKIE = "mason-local-session"
 
 # TODO: Replace the Apps routing cookie with X-Routing-Key when Databricks Apps supports it.
 
-InvokeHandler = Callable[[dict], Awaitable[dict]]
-StreamHandler = Callable[[dict], AsyncGenerator[dict, None]]
+InvokeHandler = Callable[[dict, RequestAuthContext], Awaitable[dict]]
+StreamHandler = Callable[[dict, RequestAuthContext], AsyncGenerator[dict, None]]
 
 
 def _sse(data: dict | str) -> str:
@@ -54,6 +65,19 @@ def _sse(data: dict | str) -> str:
 def _set_trace_name(name: str) -> None:
     if mlflow.get_current_active_span() is not None:
         mlflow.update_current_trace(tags={_TRACE_NAME_TAG: name})
+
+
+def _request_auth(request: Request, auth_policy: InvocationAuthPolicy) -> RequestAuthContext:
+    forwarded_token = (
+        request.headers.get(_FORWARDED_ACCESS_TOKEN_HEADER)
+        if auth_policy.requires_user_credentials
+        else None
+    )
+    return RequestAuthContext.from_forwarded_token(forwarded_token)
+
+
+def _internal_error_envelope() -> dict:
+    return MasonRuntimeError("Agent execution failed.").to_error_envelope()
 
 
 def rotate_session_cookie(request: Request, response: Response, session_id: str) -> None:
@@ -77,8 +101,12 @@ def rotate_session_cookie(request: Request, response: Response, session_id: str)
         )
 
 
-def build_app(invoke_handler: InvokeHandler, stream_handler: StreamHandler) -> FastAPI:
-    """Build the FastAPI app wiring the endpoints to the agent's invoke/stream handlers."""
+def build_app(
+    invoke_handler: InvokeHandler,
+    stream_handler: StreamHandler,
+    auth_policy: InvocationAuthPolicy,
+) -> FastAPI:
+    """Wire endpoints to handlers under the declared request-credential lifetime policy."""
     app = FastAPI(title="Agent Server")
     runs = BackgroundRuns()
 
@@ -97,33 +125,57 @@ def build_app(invoke_handler: InvokeHandler, stream_handler: StreamHandler) -> F
             )
         return response
 
-    async def _invoke(request: dict) -> dict:
+    async def _invoke(request: dict, request_auth: RequestAuthContext) -> dict:
+        failure: MasonRuntimeError | None = None
+        result: dict = {}
         with mlflow.start_span(name="invoke_handler") as span:
             _set_trace_name("invoke_handler")
             span.set_inputs(request)
-            result = await invoke_handler(request)
-            span.set_outputs(result)
-            return result
+            try:
+                result = await invoke_handler(request, request_auth)
+            except MasonRuntimeError as error:
+                failure = error
+            except Exception:
+                failure = MasonRuntimeError("Agent execution failed.")
+            span.set_outputs(failure.to_observability_envelope() if failure is not None else result)
+        if failure is not None:
+            raise failure from None
+        return result
 
-    async def _stream(request: dict) -> AsyncGenerator[str, None]:
+    async def _stream(request: dict, request_auth: RequestAuthContext) -> AsyncGenerator[str, None]:
         with mlflow.start_span(name="stream_handler") as span:
             _set_trace_name("stream_handler")
             span.set_inputs(request)
-            chunks: list[dict] = []
+            trace_chunks: list[dict] = []
             try:
-                async for chunk in stream_handler(request):
-                    chunks.append(chunk)
-                    yield _sse(chunk)
-                span.set_outputs(chunks)
-            except Exception as e:  # surface the error in-band, then close the stream
-                yield _sse({"error": str(e)})
+                async with aclosing(stream_handler(request, request_auth)) as stream:
+                    async for chunk in stream:
+                        trace_chunks.append(chunk)
+                        yield _sse(chunk)
+                span.set_outputs(trace_chunks)
+            except MasonRuntimeError as error:
+                error_chunk = error.to_error_envelope()
+                trace_chunks.append(error.to_observability_envelope())
+                span.set_outputs(trace_chunks)
+                yield _sse(error_chunk)
+            except Exception:
+                error_chunk = _internal_error_envelope()
+                trace_chunks.append(error_chunk)
+                span.set_outputs(trace_chunks)
+                yield _sse(error_chunk)
             yield _sse("[DONE]")
 
-    async def _run_background(invocation_id: str, request: dict) -> None:
+    async def _run_background(
+        invocation_id: str,
+        request: dict,
+        request_auth: RequestAuthContext,
+    ) -> None:
         try:
-            runs.complete(invocation_id, await _invoke(request))
-        except Exception as e:
-            runs.fail(invocation_id, str(e))
+            runs.complete(invocation_id, await _invoke(request, request_auth))
+        except MasonRuntimeError as error:
+            runs.fail(invocation_id, error.to_error_envelope()["error"])
+        except Exception:
+            runs.fail(invocation_id, _internal_error_envelope()["error"])
 
     @app.post("/api/invocations")
     @app.post("/invocations")
@@ -132,16 +184,27 @@ def build_app(invoke_handler: InvokeHandler, stream_handler: StreamHandler) -> F
         is_stream = bool(data.pop(_REQUEST_STREAM_PARAM_KEY, False))
         is_background = bool(data.pop(_REQUEST_BACKGROUND_PARAM_KEY, False))
         data.pop("session_id", None)
+        for key in tuple(data):
+            if key.casefold() == _FORWARDED_ACCESS_TOKEN_HEADER:
+                data.pop(key)
         data["session_id"] = request.state.session_id
 
         if is_background:
+            if not auth_policy.allows_background:
+                error = UserAuthBackgroundUnsupported()
+                return JSONResponse(error.to_error_envelope(), status_code=error.status)
+            request_auth = _request_auth(request, auth_policy)
             invocation_id = runs.start()
             # Fire-and-forget; the task updates `runs` when it finishes. Non-durable (in-memory).
-            asyncio.create_task(_run_background(invocation_id, data))
+            asyncio.create_task(_run_background(invocation_id, data, request_auth))
             return JSONResponse({"id": invocation_id, "status": "in_progress"})
+        request_auth = _request_auth(request, auth_policy)
         if is_stream:
-            return StreamingResponse(_stream(data), media_type="text/event-stream")
-        return JSONResponse(await _invoke(data))
+            return StreamingResponse(_stream(data, request_auth), media_type="text/event-stream")
+        try:
+            return JSONResponse(await _invoke(data, request_auth))
+        except MasonRuntimeError as error:
+            return JSONResponse(error.to_error_envelope(), status_code=error.status)
 
     @app.get("/api/invocations/{invocation_id}")
     @app.get("/invocations/{invocation_id}")

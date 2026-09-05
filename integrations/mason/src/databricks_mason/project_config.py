@@ -14,6 +14,7 @@ from databricks_mason.errors import AgentCliError
 
 _CONFIG_PATH = pathlib.Path(".mason/project.toml")
 _SCHEMA_VERSION = 1
+REQUEST_AUTH_CONTRACT_VERSION = 1
 _SUPPORTED_FRAMEWORKS = {"langgraph", "openai"}
 
 
@@ -23,6 +24,37 @@ class ProjectMetadata:
 
     framework: str
     template: str | None
+    request_auth_contract_version: int | None = None
+    extra_user_api_scopes: tuple[str, ...] = ()
+
+
+def _validate_request_auth_contract_version(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value != REQUEST_AUTH_CONTRACT_VERSION:
+        raise AgentCliError(
+            f"Unsupported Mason request-auth contract version {value!r}.",
+            hint=f"Expected request_auth_contract_version = {REQUEST_AUTH_CONTRACT_VERSION}.",
+        )
+    return value
+
+
+def _validate_extra_user_api_scopes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise AgentCliError("Mason project extra user API scopes must be a TOML array of strings.")
+    if any(
+        not isinstance(scope, str)
+        or not scope
+        or scope != scope.strip()
+        or any(character.isspace() or not character.isprintable() for character in scope)
+        for scope in value
+    ):
+        raise AgentCliError(
+            "Each Mason project extra user API scope must be a non-empty string without whitespace."
+        )
+    if len(value) != len(set(value)):
+        raise AgentCliError("Mason project extra user API scopes contain a duplicate scope.")
+    return tuple(sorted(value))
 
 
 def write_project_metadata(
@@ -30,14 +62,27 @@ def write_project_metadata(
     *,
     framework: str,
     template: str,
+    request_auth_contract_version: int | None = REQUEST_AUTH_CONTRACT_VERSION,
+    extra_user_api_scopes: tuple[str, ...] = (),
 ) -> pathlib.Path:
     """Write the metadata consumed by template-aware Mason commands."""
+    contract_version = _validate_request_auth_contract_version(request_auth_contract_version)
+    if not isinstance(extra_user_api_scopes, (list, tuple)):
+        raise AgentCliError("Mason project extra user API scopes must be a sequence of strings.")
+    scopes = _validate_extra_user_api_scopes(list(extra_user_api_scopes))
+    contract_line = (
+        f"request_auth_contract_version = {contract_version}\n"
+        if contract_version is not None
+        else ""
+    )
     target = project / _CONFIG_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
         f"schema_version = {_SCHEMA_VERSION}\n"
         f"framework = {json.dumps(framework)}\n"
-        f"template = {json.dumps(template)}\n",
+        f"template = {json.dumps(template)}\n"
+        f"{contract_line}"
+        f"extra_user_api_scopes = {json.dumps(list(scopes))}\n",
         encoding="utf-8",
     )
     return target
@@ -69,7 +114,8 @@ def _load_persisted_metadata(project: pathlib.Path) -> ProjectMetadata | None:
     if not path.is_file():
         return None
     data = _read_toml(path, "Mason project config")
-    if data.get("schema_version") != _SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if type(schema_version) is not int or schema_version != _SCHEMA_VERSION:
         raise AgentCliError(
             f"Unsupported Mason project config schema in {path}.",
             hint=f"Expected schema_version = {_SCHEMA_VERSION}.",
@@ -78,7 +124,16 @@ def _load_persisted_metadata(project: pathlib.Path) -> ProjectMetadata | None:
     template = data.get("template")
     if not isinstance(template, str) or not template:
         raise AgentCliError(f"Mason project config at {path} must declare a template.")
-    return ProjectMetadata(framework=framework, template=template)
+    contract_version = _validate_request_auth_contract_version(
+        data.get("request_auth_contract_version")
+    )
+    scopes = _validate_extra_user_api_scopes(data.get("extra_user_api_scopes", []))
+    return ProjectMetadata(
+        framework=framework,
+        template=template,
+        request_auth_contract_version=contract_version,
+        extra_user_api_scopes=scopes,
+    )
 
 
 def _dependency_name(requirement: str) -> str:

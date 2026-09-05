@@ -14,6 +14,7 @@ from databricks_mason.attachment import Activation, activation_for
 from databricks_mason.errors import AgentCliError
 from databricks_mason.integration_codegen import IntegrationRegistry, registry_relative_path
 from databricks_mason.integrations import (
+    AuthMode,
     Integration,
     MCPService,
     Permission,
@@ -52,11 +53,18 @@ def _source_value(spec: Integration) -> str:
     return spec.function
 
 
-def _tool_record(spec: Integration) -> dict[str, str]:
+def _auth_value(spec: Integration) -> str:
+    if isinstance(spec, (Sandbox, MCPService)):
+        return spec.auth
+    return "app/default"
+
+
+def _tool_record(spec: Integration, *, auth: str | None = None) -> dict[str, str]:
     return {
         "id": spec.id,
         "kind": spec.kind,
         "source": _source_value(spec),
+        "auth": auth if auth is not None else _auth_value(spec),
     }
 
 
@@ -84,6 +92,7 @@ def _emit_change(
     else:
         click.echo(f"Tool {spec.id!r} is already configured")
     click.echo(f"Kind: {spec.kind}")
+    click.echo(f"Auth: {_auth_value(spec)}")
     click.echo(f"Definition: {registry.path}:{definition['line']}")
     if activation.status == "attached":
         for site in activation.sites:
@@ -166,6 +175,7 @@ def _add_sandbox_to_registry(
     source: pathlib.Path,
     scopes: tuple[str, ...],
     permission: Permission,
+    auth: AuthMode,
     *,
     tool_id: str = "sandbox",
     framework: str | None = None,
@@ -182,7 +192,7 @@ def _add_sandbox_to_registry(
     _add_spec(
         obj,
         source,
-        Sandbox(tool_id, scopes=tuple(parsed)),
+        Sandbox(tool_id, scopes=tuple(parsed), auth=auth),
         framework=framework,
     )
 
@@ -221,6 +231,16 @@ def _framework_option(function):
     )(function)
 
 
+def _auth_option(function):
+    return click.option(
+        "--auth",
+        type=click.Choice(["user", "app"]),
+        default="user",
+        show_default=True,
+        help="Identity used for this Databricks AI Gateway integration.",
+    )(function)
+
+
 @add.command("sandbox")
 @click.option(
     "--scope",
@@ -236,6 +256,7 @@ def _framework_option(function):
     show_default=True,
 )
 @click.option("--name", "tool_id", default="sandbox", show_default=True)
+@_auth_option
 @_source_option
 @_framework_option
 @click.pass_obj
@@ -244,6 +265,7 @@ def add_sandbox(
     scopes: tuple[str, ...],
     permission: Permission,
     tool_id: str,
+    auth: AuthMode,
     source: pathlib.Path,
     framework: str | None,
 ) -> None:
@@ -253,6 +275,7 @@ def add_sandbox(
         source.resolve(),
         scopes,
         permission,
+        auth,
         tool_id=tool_id,
         framework=framework,
     )
@@ -261,6 +284,7 @@ def add_sandbox(
 @add.command("mcp")
 @click.argument("service")
 @click.option("--name", "tool_id", default=None)
+@_auth_option
 @_source_option
 @_framework_option
 @click.pass_obj
@@ -268,6 +292,7 @@ def add_mcp(
     obj: Any,
     service: str,
     tool_id: str | None,
+    auth: AuthMode,
     source: pathlib.Path,
     framework: str | None,
 ) -> None:
@@ -276,7 +301,7 @@ def add_mcp(
     _add_spec(
         obj,
         source.resolve(),
-        MCPService(tool_id or _default_id(service), service=service),
+        MCPService(tool_id or _default_id(service), service=service, auth=auth),
         framework=framework,
     )
 
@@ -316,12 +341,18 @@ def list_tools(obj: Any, source: pathlib.Path, framework: str | None) -> None:
     project = source.expanduser().resolve()
     metadata = load_project_metadata(project, framework_override=framework)
     registry = _registry(project, metadata)
-    rows = [_tool_record(spec) for spec in registry.integrations]
+    rows = [
+        _tool_record(
+            spec,
+            auth="unspecified" if spec.id in registry.legacy_auth_ids else None,
+        )
+        for spec in registry.integrations
+    ]
     if getattr(obj, "output", "text") == "json":
         render.emit_json({"schema_version": 1, "tools": rows})
         return
     render.resource_table(
         "Agent tools",
-        [("ID", "left"), ("KIND", "left"), ("SOURCE", "left")],
-        [(row["id"], row["kind"], row["source"]) for row in rows],
+        [("ID", "left"), ("KIND", "left"), ("SOURCE", "left"), ("AUTH", "left")],
+        [(row["id"], row["kind"], row["source"], row["auth"]) for row in rows],
     )

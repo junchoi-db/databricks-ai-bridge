@@ -7,14 +7,16 @@ DATABRICKS_TOOLS: tuple[mason_integrations.Integration, ...] = (
         id="sandbox",
         scopes=(
             mason_integrations.Scope.table(
-                "samples.nyctaxi.trips",
+                "__SANDBOX_TABLE__",
                 permission="read_only",
             ),
         ),
+        auth="app",
     ),
     mason_integrations.MCPService(
-        id="web_search",
-        service="system.ai.web_search",
+        id="google_drive",
+        service="system.ai.google_drive",
+        auth="user",
     ),
     mason_integrations.UCFunction(
         id="mason_uc_marker",

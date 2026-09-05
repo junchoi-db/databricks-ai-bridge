@@ -11,11 +11,14 @@ before a template has merged to its canonical repo.
 
 from __future__ import annotations
 
+import ast
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
 from importlib.metadata import PackageNotFoundError
+from importlib.metadata import distribution as _installed_distribution
 from importlib.metadata import version as _installed_version
 from typing import Optional
 
@@ -24,7 +27,7 @@ import click
 from databricks_mason import render
 from databricks_mason.errors import AgentCliError
 from databricks_mason.integration_codegen import IntegrationRegistry, registry_relative_path
-from databricks_mason.project_config import write_project_metadata
+from databricks_mason.project_config import REQUEST_AUTH_CONTRACT_VERSION, write_project_metadata
 
 # Each framework's template has its own home: the git repo, ref, and path-within-repo to fetch.
 # Both basic templates live in this repo, versioned in lockstep with the CLI (see below).
@@ -57,14 +60,62 @@ _CHAT_APP_TEMPLATES = {
     "openai": "integrations/mason/templates/ui/agent-openai",
 }
 
+_TEMPLATE_RUNTIME_PATH = pathlib.Path("runtime/runtime.py")
+_REQUEST_AUTH_CONTRACT_MARKER = "REQUEST_AUTH_CONTRACT_VERSION"
+_RUNTIME_EXTRAS = {"langgraph": "runtime", "openai": "runtime-openai"}
+
+
+def _template_request_auth_contract_version(template: pathlib.Path) -> int | None:
+    """Read a supported literal request-auth marker without importing template code."""
+    try:
+        source = (template / _TEMPLATE_RUNTIME_PATH).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except (OSError, UnicodeError, SyntaxError):
+        return None
+
+    assignments: list[ast.AST | None] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            matching_targets = [
+                target
+                for target in statement.targets
+                if isinstance(target, ast.Name) and target.id == _REQUEST_AUTH_CONTRACT_MARKER
+            ]
+            if matching_targets:
+                assignments.append(statement.value if len(statement.targets) == 1 else None)
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == _REQUEST_AUTH_CONTRACT_MARKER
+        ):
+            assignments.append(statement.value)
+        elif (
+            isinstance(statement, ast.AugAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == _REQUEST_AUTH_CONTRACT_MARKER
+        ):
+            assignments.append(None)
+
+    if len(assignments) != 1:
+        return None
+    value = assignments[0]
+    if (
+        not isinstance(value, ast.Constant)
+        or type(value.value) is not int
+        or value.value != REQUEST_AUTH_CONTRACT_VERSION
+    ):
+        return None
+    return value.value
+
 
 def _template_ref(framework: str) -> str:
     """The git ref to fetch a framework's template from, absent a `--ref` override.
 
     For a versioned framework, fetch the tag matching the installed CLI so the scaffold's pinned
     `databricks-mason` matches what the user has. Fall back to the default ref when the version
-    isn't a published release — an editable/dev build (e.g. `0.1.0.dev0`, or a local `+`
-    local-version install) has no corresponding tag, so those keep fetching `main`.
+    isn't a published release. Direct/editable installs and local `+` versions have no matching
+    tag, so those keep fetching `main`; a prerelease such as `0.1.2.dev0` installed from an index
+    is still a published release and uses its tag.
     """
     default_ref = _TEMPLATES[framework]["ref"]
     if framework not in _VERSIONED_TEMPLATES:
@@ -73,9 +124,50 @@ def _template_ref(framework: str) -> str:
         installed = _installed_version("databricks-mason")
     except PackageNotFoundError:
         return default_ref
-    if "dev" in installed or "+" in installed:
+    if _is_direct_url_install() or "+" in installed:
         return default_ref
     return f"{_RELEASE_TAG_PREFIX}{installed}"
+
+
+def _is_direct_url_install() -> bool:
+    """Whether Mason came from a local/direct URL rather than a package index."""
+
+    try:
+        direct_url = _installed_distribution("databricks-mason").read_text("direct_url.json")
+    except PackageNotFoundError:
+        return False
+    return bool(direct_url and direct_url.strip())
+
+
+def _pin_template_runtime(dest: pathlib.Path, framework: str) -> str | None:
+    """Pin a generated release scaffold to the exact installed Mason runtime."""
+
+    pyproject = dest / "pyproject.toml"
+    if framework not in _VERSIONED_TEMPLATES or not pyproject.is_file():
+        return None
+    try:
+        installed = _installed_version("databricks-mason")
+    except PackageNotFoundError:
+        return None
+    if _is_direct_url_install() or "+" in installed:
+        return None
+
+    extra = _RUNTIME_EXTRAS[framework]
+    source = pyproject.read_text(encoding="utf-8")
+    dependency = re.compile(
+        rf'(?P<quote>["\'])databricks-mason\[{re.escape(extra)}\][^"\']*(?P=quote)'
+    )
+    matches = list(dependency.finditer(source))
+    if len(matches) != 1:
+        raise AgentCliError(
+            f"Expected one databricks-mason[{extra}] dependency in {pyproject}.",
+            hint="The selected template is not compatible with this Mason release.",
+        )
+    quote = matches[0].group("quote")
+    pinned = f"databricks-mason[{extra}]=={installed}"
+    updated = source[: matches[0].start()] + f"{quote}{pinned}{quote}" + source[matches[0].end() :]
+    pyproject.write_text(updated, encoding="utf-8")
+    return pinned
 
 
 def _git(args: list[str], *, cwd: Optional[pathlib.Path] = None) -> subprocess.CompletedProcess:
@@ -224,9 +316,16 @@ def init(
         dest,
         overlay_dirs,
     )
+    _pin_template_runtime(dest, framework)
 
     template_name = pathlib.PurePosixPath(template_path).name
-    write_project_metadata(dest, framework=framework, template=template_name)
+    request_auth_contract_version = _template_request_auth_contract_version(dest)
+    write_project_metadata(
+        dest,
+        framework=framework,
+        template=template_name,
+        request_auth_contract_version=request_auth_contract_version,
+    )
     relative_registry = registry_relative_path(framework)
     registry_path = dest / relative_registry
     if registry_path.is_file():
@@ -244,6 +343,8 @@ def init(
                 "directory": str(dest),
                 "chat_app_enabled": chat_app_enabled,
                 "env_profile": env_profile if wrote_env else None,
+                "request_auth_contract_version": request_auth_contract_version,
+                "extra_user_api_scopes": [],
             }
         )
         return

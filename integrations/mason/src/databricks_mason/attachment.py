@@ -8,6 +8,14 @@ from dataclasses import dataclass
 
 from databricks_mason.project_config import ProjectMetadata
 
+_LANGGRAPH_SNIPPET = (
+    "*await load_tools(DATABRICKS_TOOLS, workspace_client_for=request_auth.client_for)"
+)
+_OPENAI_SNIPPET = (
+    "agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack, "
+    "workspace_client_for=request_auth.client_for)"
+)
+
 
 @dataclass(frozen=True)
 class AttachmentSite:
@@ -143,7 +151,7 @@ def _required_template(
             "agent.databricks_tools",
             "load_tools",
             ("create_agent_graph",),
-            "*await load_tools(DATABRICKS_TOOLS)",
+            _LANGGRAPH_SNIPPET,
         )
     if metadata.framework == "openai" and metadata.template == "agent-openai":
         return (
@@ -152,7 +160,7 @@ def _required_template(
             "agent.databricks_tools",
             "bind_tools",
             ("stream_handler",),
-            "agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack)",
+            _OPENAI_SNIPPET,
         )
     return None
 
@@ -161,11 +169,7 @@ def activation_for(project: pathlib.Path, metadata: ProjectMetadata) -> Activati
     required = _required_template(project, metadata)
     if required is None:
         call = "load_tools" if metadata.framework == "langgraph" else "bind_tools"
-        snippet = (
-            "*await load_tools(DATABRICKS_TOOLS)"
-            if call == "load_tools"
-            else "agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack)"
-        )
+        snippet = _LANGGRAPH_SNIPPET if call == "load_tools" else _OPENAI_SNIPPET
         imports = (
             (
                 "from agent.databricks_tools import DATABRICKS_TOOLS",
