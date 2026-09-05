@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from databricks_langchain import DatabricksMCPServer, DatabricksMultiServerMCPClient
@@ -14,10 +15,16 @@ if TYPE_CHECKING:
     from databricks_langchain import MCPServer
 
 from databricks_mason.integrations import (
+    AuthMode,
     Integration,
     MCPService,
     Sandbox,
     downscope_wire,
+)
+from databricks_mason.runtime.auth import integration_client_resolver
+from databricks_mason.runtime.errors import (
+    classify_managed_mcp_exception,
+    classify_managed_mcp_result,
 )
 from databricks_mason.runtime.workspace import workspace_client as _default_workspace_client
 from databricks_mason.runtime.workspace import workspace_headers
@@ -69,10 +76,46 @@ def _sandbox_interceptor(
     return interceptor
 
 
+def _managed_server_interceptor(managed_servers: dict[str, tuple[AuthMode, str]]):
+    async def interceptor(request: Any, handler: Any) -> Any:
+        binding = managed_servers.get(request.server_name)
+        if binding is None:
+            return await handler(request)
+        auth_mode, workspace_url = binding
+
+        normalized = None
+        try:
+            result = await handler(request)
+        except Exception as error:
+            normalized = classify_managed_mcp_exception(
+                error,
+                integration_id=request.server_name,
+                workspace_url=workspace_url,
+                auth_mode=auth_mode,
+            )
+            if normalized is None:
+                raise
+        if normalized is not None:
+            raise normalized from None
+
+        normalized = classify_managed_mcp_result(
+            result,
+            integration_id=request.server_name,
+            workspace_url=workspace_url,
+            auth_mode=auth_mode,
+        )
+        if normalized is not None:
+            raise normalized from None
+        return result
+
+    return interceptor
+
+
 def mcp_client(
     servers: Sequence[DatabricksMCPServer],
     *,
     sandboxes: dict[str, tuple[Sandbox, DatabricksMCPServer]] | None = None,
+    managed_servers: dict[str, tuple[AuthMode, str]] | None = None,
 ) -> DatabricksMultiServerMCPClient:
     """Build a native client whose Sandbox policy closes over the explicit selection."""
 
@@ -85,10 +128,54 @@ def mcp_client(
     for name, (sandbox, server) in (sandboxes or {}).items():
         if sandbox.id != name or server.name != name or server not in server_list:
             raise ValueError(f"Sandbox binding {name!r} does not match its MCP server.")
-    interceptors = [_sandbox_interceptor(sandboxes)] if sandboxes else []
+    server_names = set(names)
+    if unknown := sorted(set(managed_servers or {}) - server_names):
+        rendered = ", ".join(repr(name) for name in unknown)
+        raise ValueError(f"Managed MCP bindings do not match a server: {rendered}.")
+    interceptors = []
+    if managed_servers:
+        interceptors.append(_managed_server_interceptor(managed_servers))
+    if sandboxes:
+        interceptors.append(_sandbox_interceptor(sandboxes))
     # DatabricksMCPServer is a subclass of MCPServer, so coerce the type for the API
     servers_as_mcp = cast("list[MCPServer]", server_list)
     return DatabricksMultiServerMCPClient(servers_as_mcp, tool_interceptors=interceptors)
+
+
+async def _discover_tools(
+    client: DatabricksMultiServerMCPClient,
+    servers: Sequence[DatabricksMCPServer],
+    managed_servers: dict[str, tuple[AuthMode, str]],
+) -> list[Any]:
+    async def discover(server: DatabricksMCPServer) -> list[Any]:
+        binding = managed_servers.get(server.name)
+        if binding is None:
+            return await client.get_tools(server_name=server.name)
+        auth_mode, workspace_url = binding
+
+        normalized = None
+        try:
+            return await client.get_tools(server_name=server.name)
+        except Exception as error:
+            normalized = classify_managed_mcp_exception(
+                error,
+                integration_id=server.name,
+                workspace_url=workspace_url,
+                auth_mode=auth_mode,
+            )
+            if normalized is None:
+                raise
+        raise normalized from None
+
+    tasks = [asyncio.create_task(discover(server)) for server in servers]
+    try:
+        groups = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return [tool for group in groups for tool in group]
 
 
 async def load_tools(
@@ -96,6 +183,7 @@ async def load_tools(
     *,
     extra_servers: Sequence[DatabricksMCPServer] = (),
     workspace_client: WorkspaceClient | None = None,
+    workspace_client_for: Callable[[AuthMode], WorkspaceClient] | None = None,
     existing_tools: Sequence[Any] = (),
 ) -> list:
     """Resolve only ``integrations`` and return their native LangChain tools."""
@@ -111,19 +199,35 @@ async def load_tools(
             f"Integration and MCP server names must be unique; duplicates: {rendered}."
         )
 
+    client_for_integration = integration_client_resolver(
+        selected,
+        workspace_client=workspace_client,
+        workspace_client_for=workspace_client_for,
+        default_workspace_client=_default_workspace_client,
+    )
     declared_servers: list[DatabricksMCPServer] = []
     sandbox_bindings: dict[str, tuple[Sandbox, DatabricksMCPServer]] = {}
-    if selected:
-        client = workspace_client or _default_workspace_client()
-        for item in selected:
-            server = _server_from_integration(item, client)
-            declared_servers.append(server)
-            if isinstance(item, Sandbox):
-                sandbox_bindings[item.id] = (item, server)
+    managed_servers: dict[str, tuple[AuthMode, str]] = {}
+    for item in selected:
+        integration_client = client_for_integration(item)
+        server = _server_from_integration(item, integration_client)
+        declared_servers.append(server)
+        if isinstance(item, (MCPService, Sandbox)):
+            managed_servers[item.id] = (item.auth, integration_client.config.host)
+        if isinstance(item, Sandbox):
+            sandbox_bindings[item.id] = (item, server)
     servers = [*declared_servers, *supplied_servers]
     if not servers:
         return []
-    tools = await mcp_client(servers, sandboxes=sandbox_bindings).get_tools()
+    tools = await _discover_tools(
+        mcp_client(
+            servers,
+            sandboxes=sandbox_bindings,
+            managed_servers=managed_servers,
+        ),
+        servers,
+        managed_servers,
+    )
     tool_names = [
         name
         for tool in (*existing_tools, *tools)
@@ -143,5 +247,6 @@ async def mcp_tools(extra_servers: list[DatabricksMCPServer] | None = None) -> l
     raise RuntimeError(
         "mcp_tools() no longer discovers tools from agent.toml; migrate the selected "
         "integrations to DATABRICKS_TOOLS and call "
-        "load_tools(DATABRICKS_TOOLS, extra_servers=build_mcp_servers())."
+        "load_tools(DATABRICKS_TOOLS, extra_servers=build_mcp_servers(), "
+        "workspace_client_for=request_auth.client_for)."
     )

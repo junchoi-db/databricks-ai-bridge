@@ -17,12 +17,20 @@ import pathlib
 from typing import Any, Optional
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.apps import App
 
 from databricks_mason import models
 from databricks_mason.errors import AgentCliError, wrap_api_error
 
 _BASE = "/api/agents/v1"
 _MCP_SERVICES_PATH = "/api/2.1/unity-catalog/mcp-services"
+
+
+class _UserApiScopesPayload(list[str]):
+    """Keep an explicit empty list in SDK 0.133's truthiness-based App serializer."""
+
+    def __bool__(self) -> bool:
+        return True
 
 
 def _query(**kwargs: Any) -> dict[str, Any]:
@@ -130,6 +138,30 @@ class MasonClient:
     def current_user(self) -> str:
         """The authenticated user's name (used to derive the app source workspace path)."""
         return str(self._w.current_user.me().user_name or "unknown")
+
+    def get_app(self, name: str) -> App:
+        """Get one Databricks App through the typed SDK surface."""
+        try:
+            return self._w.apps.get(name)
+        except Exception as exc:  # noqa: BLE001 - normalized to AgentCliError
+            raise wrap_api_error(exc) from exc
+
+    def create_app(self, name: str, user_api_scopes: list[str]) -> App:
+        """Create an App with its complete requested user API scope set."""
+        request = App(name=name, user_api_scopes=_UserApiScopesPayload(user_api_scopes))
+        try:
+            return self._w.apps.create(request).response
+        except Exception as exc:  # noqa: BLE001 - normalized to AgentCliError
+            raise wrap_api_error(exc) from exc
+
+    def update_app(self, name: str, user_api_scopes: list[str]) -> App:
+        """Replace an App's requested user API scope set exactly."""
+        request = App(name=name, user_api_scopes=_UserApiScopesPayload(user_api_scopes))
+        try:
+            self._w.apps.create_update_and_wait(name, "user_api_scopes", app=request)
+            return self._w.apps.get(name)
+        except Exception as exc:  # noqa: BLE001 - normalized to AgentCliError
+            raise wrap_api_error(exc) from exc
 
     def ensure_workspace_dir(self, path: str) -> None:
         """Create a workspace directory (and parents), idempotently.

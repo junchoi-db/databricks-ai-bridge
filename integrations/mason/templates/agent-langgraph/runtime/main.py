@@ -20,7 +20,11 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 agent.agent.configure()
 
 # Module-level app so uvicorn can import it by string (and to enable multiple workers).
-app = build_app(agent.agent.invoke_handler, agent.agent.stream_handler)
+app = build_app(
+    agent.agent.invoke_handler,
+    agent.agent.stream_handler,
+    agent.agent.AUTH_POLICY,
+)
 
 
 def main():

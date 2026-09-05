@@ -214,7 +214,9 @@ curl -s -b "$COOKIE_JAR" -X POST "$BASE/invocations" -H "Content-Type: applicati
   collected automatically (see `agent/tools/sample_tool.py`). No wiring to edit.
 - **Add a Databricks integration:** run `mason tools add sandbox`, `mason tools add mcp`, or
   `mason tools add uc-function`. The CLI updates `agent/databricks_tools.py` and reports its exact
-  definition and active attachment lines.
+  definition and active attachment lines. Choose `--auth user|app` when adding Sandbox or MCP;
+  both default to request-user auth. `app` is the dedicated App service principal, never the
+  creator. UC Function and custom servers in `build_mcp_servers()` keep their existing credentials.
 - **Require approval for a tool:** add its name to `REQUIRE_APPROVAL` in `agent/agent.py` (see the
   human-in-the-loop section above); empty the dict to disable gating.
 - **Add a custom MCP server:** append a `DatabricksMCPServer` to `build_mcp_servers()` in
@@ -251,6 +253,15 @@ deploys the App.
 
 `app.yaml` carries the app's start command and env. By default the deployed app is the same lean
 backend: in-process session state, tracing off.
+
+For `auth="user"` Sandbox or managed MCP tools, Mason configures the App's `ai-gateway` user API
+scope and the runtime uses the Apps-forwarded caller credential. Browser/workspace callers may need
+to leave and re-enter the App and consent again after that scope changes; external OAuth callers
+must refresh a token covering the App's scopes. Missing or invalid scoped user auth fails closed and
+never falls back to the App service principal. User-auth tools are foreground-only; submit
+`background: true` only from an App-only integration registry.
+During local development, `auth="app"` uses the selected profile; only a deployed Databricks App
+has the dedicated App service principal and its grants.
 
 ### Enable MLflow tracing (optional)
 

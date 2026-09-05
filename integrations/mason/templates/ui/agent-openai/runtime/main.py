@@ -6,15 +6,18 @@ from pathlib import Path
 import agent.agent
 import uvicorn
 from dotenv import load_dotenv
-
 from runtime.runtime import build_app
 from runtime.ui import install_ui
 
 load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=True)
 agent.agent.configure()
 
-app = build_app(agent.agent.invoke_handler, agent.agent.stream_handler)
-install_ui(app)
+app = build_app(
+    agent.agent.invoke_handler,
+    agent.agent.stream_handler,
+    agent.agent.AUTH_POLICY,
+)
+install_ui(app, agent.agent.AUTH_POLICY)
 
 
 def main():

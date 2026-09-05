@@ -86,6 +86,12 @@ function setBusy(busy, label = "Working") {
   else if (!elements.runStatus.classList.contains("error")) setStatus("Ready");
 }
 
+function selectMode(button) {
+  if (!button || button.disabled) return;
+  state.mode = button.dataset.mode;
+  document.querySelectorAll(".mode-button").forEach((item) => item.classList.toggle("active", item === button));
+}
+
 function setCapability(element, state) {
   const degraded = state === "degraded";
   element.classList.toggle("enabled", state === true);
@@ -99,6 +105,47 @@ function formatJson(value) {
   } catch {
     return String(value);
   }
+}
+
+function structuredError(value) {
+  if (value instanceof Error && value.details && typeof value.details === "object") return value.details;
+  if (value?.error && typeof value.error === "object") return value.error;
+  if (value && typeof value === "object" && typeof value.message === "string") return value;
+  return null;
+}
+
+function requestError(value, fallback = "Request failed.") {
+  const details = structuredError(value);
+  const message = details?.message || (typeof value === "string" ? value : fallback);
+  const error = new Error(message);
+  if (details) error.details = details;
+  return error;
+}
+
+function authorizationLinks(error) {
+  const details = structuredError(error);
+  const elicitations = details?.code === "MCP_AUTHORIZATION_REQUIRED" ? details?.data?.elicitations : [];
+  if (!Array.isArray(elicitations)) return [];
+  return elicitations.flatMap((elicitation) => {
+    if (elicitation?.mode !== "url" || typeof elicitation?.url !== "string") return [];
+    try {
+      const url = new URL(elicitation.url);
+      if (
+        url.protocol !== "https:" ||
+        url.username ||
+        url.password ||
+        !url.pathname.startsWith("/explore/data/mcp-services/")
+      ) {
+        return [];
+      }
+      return [{
+        label: typeof elicitation.message === "string" ? elicitation.message : "Authorize integration",
+        url: url.href,
+      }];
+    } catch {
+      return [];
+    }
+  });
 }
 
 function addEvent(type, payload) {
@@ -174,10 +221,20 @@ function appendMessage(role, content, label) {
 }
 
 function appendError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  appendMessage("error", message, "Request failed");
+  const normalized = error instanceof Error ? error : requestError(error);
+  const message = normalized.message;
+  const rendered = appendMessage("error", message, "Request failed");
+  for (const link of authorizationLinks(normalized)) {
+    rendered.text.append(document.createElement("br"));
+    const anchor = document.createElement("a");
+    anchor.href = link.url;
+    anchor.textContent = link.label;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    rendered.text.append(anchor);
+  }
   setStatus("Error", "error");
-  addEvent("error", { message });
+  addEvent("error", { code: structuredError(normalized)?.code, message });
 }
 
 function startDraft() {
@@ -257,7 +314,7 @@ function handleEvent(event) {
   if (event?.type === "delta") appendDelta(event.content);
   if (event?.type === "message") handleAgentMessage(event.message);
   if (event?.type === "interrupt") handleInterrupt(event);
-  if (event?.error) throw new Error(event.error);
+  if (event?.error) throw requestError(event.error);
 }
 
 function handleOutput(output) {
@@ -279,7 +336,9 @@ function invocationPayload(payload) {
 
 async function jsonResponse(response) {
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || body.error || `Request failed with ${response.status}`);
+  if (!response.ok) {
+    throw requestError(body.detail || body.error, `Request failed with ${response.status}`);
+  }
   return body;
 }
 
@@ -545,7 +604,9 @@ async function pollBackground(invocationId) {
       handleOutput(result.output);
       return result;
     }
-    if (result.status === "failed") throw new Error(result.error || "Background invocation failed");
+    if (result.status === "failed") {
+      throw requestError(result.error || "Background invocation failed");
+    }
     setStatus(`Background · ${result.status}`, "busy");
   }
   throw new Error("Background invocation did not finish within three minutes.");
@@ -688,6 +749,11 @@ async function loadConfig() {
     elements.memoryMode.textContent = config.memory.enabled ? `Managed · actor ${config.memory.actor}` : "Not connected";
     setCapability(elements.streamingStatus, config.streaming.enabled);
     setCapability(elements.backgroundStatus, config.background.enabled);
+    const backgroundButton = document.querySelector('[data-mode="background"]');
+    backgroundButton.disabled = !config.background.enabled;
+    if (backgroundButton.disabled && state.mode === "background") {
+      selectMode(document.querySelector('[data-mode="streaming"]'));
+    }
     setCapability(
       elements.sessionStatus,
       config.session.managed ? true : config.session.history ? "degraded" : false,
@@ -741,10 +807,7 @@ elements.promptInput.addEventListener("keydown", (event) => {
 });
 
 document.querySelectorAll(".mode-button").forEach((button) => {
-  button.addEventListener("click", () => {
-    state.mode = button.dataset.mode;
-    document.querySelectorAll(".mode-button").forEach((item) => item.classList.toggle("active", item === button));
-  });
+  button.addEventListener("click", () => selectMode(button));
 });
 
 document.querySelectorAll("[data-prompt]").forEach((button) => {

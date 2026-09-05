@@ -10,6 +10,7 @@ import json
 from typing import Optional
 
 import click
+from databricks.sdk.errors import NotFound
 from rich.console import Console
 from rich.text import Text
 
@@ -69,6 +70,8 @@ def wrap_api_error(exc: Exception) -> AgentCliError:
     hierarchy or version.
     """
     error_code = getattr(exc, "error_code", None)
+    if isinstance(exc, NotFound) and not error_code:
+        error_code = "NOT_FOUND"
     message = str(exc).strip() or exc.__class__.__name__
     hint = _PREVIEW_HINT if error_code in _PREVIEW_ERROR_CODES else None
     return AgentCliError(message, error_code=error_code, hint=hint)

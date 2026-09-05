@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import pathlib
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import click
@@ -21,6 +22,12 @@ import yaml
 
 from databricks_mason import memory_store_access, render, session_store_access, timefmt
 from databricks_mason.errors import AgentCliError
+from databricks_mason.integration_codegen import IntegrationRegistry, registry_relative_path
+from databricks_mason.integrations import MCPService, Sandbox
+from databricks_mason.project_config import (
+    REQUEST_AUTH_CONTRACT_VERSION,
+    load_project_metadata,
+)
 from databricks_mason.render import field
 from databricks_mason.store_access import _databricks, apply_postgres_resources, grant_tables
 from databricks_mason.tracing import TRACES_DEST_ENV, TRACES_EXPERIMENT_ENV, default_experiment
@@ -36,6 +43,62 @@ _SESSION_ACTOR_ENV = "AGENT_SESSION_ACTOR_ID"
 # PIP_INDEX_URL; uv reads UV_INDEX_URL / UV_DEFAULT_INDEX — set all three to cover both build paths.
 _DEFAULT_PIP_INDEX_URL = "https://pypi.org/simple/"
 _PIP_INDEX_ENVS = ("PIP_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX")
+
+_PROJECT_CONFIG_PATH = pathlib.Path(".mason/project.toml")
+_DEFAULT_REGISTRY_PATH = pathlib.Path("agent/databricks_tools.py")
+_APP_NOT_FOUND_CODES = frozenset({"NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"})
+_USER_SCOPE_POLL_TIMEOUT_S = 60.0
+_USER_SCOPE_POLL_INTERVAL_S = 1.0
+
+
+@dataclass(frozen=True)
+class _DeploymentAuthPlan:
+    desired_scopes: tuple[str, ...]
+    app_auth_integration_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _AppScopeState:
+    requested_scopes: tuple[str, ...]
+    effective_scopes: tuple[str, ...]
+    changed: bool
+    created: bool
+
+
+def _deployment_auth_warnings(
+    auth_plan: _DeploymentAuthPlan, scope_state: _AppScopeState
+) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if scope_state.changed:
+        warnings.append(
+            {
+                "code": "USER_API_SCOPES_CHANGED",
+                "message": "Users must re-consent to the App's requested user API scopes and "
+                "remint their forwarded access token before invoking user-auth integrations.",
+                "reconsent_required": True,
+                "token_remint_required": True,
+            }
+        )
+    if auth_plan.app_auth_integration_ids:
+        integration_ids = list(auth_plan.app_auth_integration_ids)
+        warnings.append(
+            {
+                "code": "APP_AUTH_SHARED_AUTHORITY",
+                "message": "Shared-authority warning: every user who CAN USE this App can invoke "
+                'these auth="app" integrations with the App service principal\'s authority: '
+                f"{', '.join(integration_ids)}.",
+                "integration_ids": integration_ids,
+            }
+        )
+    return warnings
+
+
+def _emit_deployment_auth_warnings(warnings: list[dict[str, Any]], output: str) -> None:
+    for warning in warnings:
+        if output == "json":
+            click.echo(json.dumps({"warning": warning}, sort_keys=True), err=True)
+        else:
+            click.echo(f"Warning: {warning['message']}", err=True)
 
 
 # --- databricks CLI plumbing (the deployment runtime) -----------------------
@@ -106,6 +169,193 @@ def _wait_for_running(name: str, profile: Optional[str], timeout_s: int = 300) -
         f"App '{name}' did not reach a running state within {timeout_s}s.",
         hint=f"Check `mason deployments get {name}`, then re-run deploy once it's running.",
     )
+
+
+def _load_deployment_auth_plan(source: pathlib.Path) -> _DeploymentAuthPlan | None:
+    """Statically derive Apps user scopes and shared-App-auth integrations for a Mason source."""
+    has_metadata = (source / _PROJECT_CONFIG_PATH).is_file()
+    has_default_registry = (source / _DEFAULT_REGISTRY_PATH).is_file()
+    if not has_metadata and not has_default_registry:
+        return None
+
+    metadata = load_project_metadata(source) if has_metadata else None
+    relative_registry = (
+        registry_relative_path(metadata.framework)
+        if metadata is not None
+        else _DEFAULT_REGISTRY_PATH
+    )
+    registry = IntegrationRegistry.load(source, relative_path=relative_registry)
+    if registry.legacy_auth_ids:
+        edits = "; ".join(
+            f"{registry.path}:{registry.definition_line(integration_id)} ({integration_id!r}): "
+            'add auth="user" or auth="app"'
+            for integration_id in sorted(registry.legacy_auth_ids)
+        )
+        raise AgentCliError(
+            "The canonical Databricks integration registry contains entries with unspecified "
+            f"legacy auth: {', '.join(sorted(registry.legacy_auth_ids))}.",
+            hint=f"Make these exact edits before deploying: {edits}.",
+        )
+
+    user_auth_ids = tuple(
+        sorted(
+            integration.id
+            for integration in registry.integrations
+            if integration.required_user_scopes
+        )
+    )
+    declared_extra_scopes = metadata.extra_user_api_scopes if metadata is not None else ()
+    desired_scopes = set(declared_extra_scopes)
+    for integration in registry.integrations:
+        desired_scopes.update(integration.required_user_scopes)
+    contract_version = metadata.request_auth_contract_version if metadata is not None else None
+    if desired_scopes and contract_version != REQUEST_AUTH_CONTRACT_VERSION:
+        reasons = []
+        if user_auth_ids:
+            reasons.append(f"user-auth integrations: {', '.join(user_auth_ids)}")
+        if declared_extra_scopes:
+            reasons.append(f"declared extra scopes: {', '.join(declared_extra_scopes)}")
+        raise AgentCliError(
+            f"Mason request-auth contract version {REQUEST_AUTH_CONTRACT_VERSION} is required "
+            f"before deploying requested user API scopes ({'; '.join(reasons)}).",
+            hint="Regenerate the project with the current `mason init` template, then migrate "
+            "the request handler before setting request_auth_contract_version = 1.",
+        )
+    if declared_extra_scopes and not user_auth_ids:
+        raise AgentCliError(
+            "Mason request-auth contract version 1 cannot activate extra_user_api_scopes "
+            "without a declarative user-auth integration.",
+            hint='Add at least one MCPService or Sandbox with auth="user", or remove the extra '
+            "scopes. Custom-only request-user auth requires a future runtime-policy contract.",
+        )
+
+    app_auth_ids = tuple(
+        sorted(
+            integration.id
+            for integration in registry.integrations
+            if isinstance(integration, (MCPService, Sandbox)) and integration.auth == "app"
+        )
+    )
+    return _DeploymentAuthPlan(tuple(sorted(desired_scopes)), app_auth_ids)
+
+
+def _app_scopes(app: Any, attribute: str) -> tuple[str, ...]:
+    raw = getattr(app, attribute, None)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or any(not isinstance(scope, str) for scope in raw):
+        raise AgentCliError(f"Databricks Apps returned invalid {attribute} for {app.name!r}.")
+    return tuple(sorted(raw))
+
+
+def _poll_effective_user_api_scopes(
+    client,
+    name: str,
+    desired_scopes: tuple[str, ...],
+    *,
+    poll_timeout_s: float,
+    poll_interval_s: float,
+    propagating_from_scopes: tuple[str, ...] | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    deadline = time.monotonic() + poll_timeout_s
+    while True:
+        app = client.get_app(name)
+        requested = _app_scopes(app, "user_api_scopes")
+        if requested != desired_scopes:
+            if requested == propagating_from_scopes:
+                if time.monotonic() < deadline:
+                    if poll_interval_s > 0:
+                        time.sleep(poll_interval_s)
+                    continue
+                raise AgentCliError(
+                    f"App '{name}' did not make requested user API scopes visible within "
+                    f"{poll_timeout_s:g}s (expected {list(desired_scopes)!r}, still found "
+                    f"{list(requested)!r}).",
+                    hint="The Apps control plane may still be propagating the write; re-run deploy "
+                    "after checking the App's requested scopes.",
+                )
+            raise AgentCliError(
+                f"App '{name}' user API scopes changed concurrently while Mason was reconciling "
+                f"them (expected {list(desired_scopes)!r}, found {list(requested)!r}).",
+                hint="Review the App's requested scopes and re-run deploy; Mason did not overwrite "
+                "the concurrent change.",
+            )
+        effective = _app_scopes(app, "effective_user_api_scopes")
+        missing = sorted(set(desired_scopes) - set(effective))
+        if not missing:
+            return requested, effective
+        if time.monotonic() >= deadline:
+            raise AgentCliError(
+                f"App '{name}' did not make required user API scopes effective within "
+                f"{poll_timeout_s:g}s: {', '.join(missing)}.",
+                hint="Ask a workspace administrator to allow the scopes, then re-run deploy. "
+                "Source sync and App deployment were not started.",
+            )
+        if poll_interval_s > 0:
+            time.sleep(poll_interval_s)
+
+
+def _reconcile_user_api_scopes(
+    client,
+    name: str,
+    desired_scopes: tuple[str, ...],
+    *,
+    confirm_removal: bool,
+    poll_timeout_s: float = _USER_SCOPE_POLL_TIMEOUT_S,
+    poll_interval_s: float = _USER_SCOPE_POLL_INTERVAL_S,
+) -> _AppScopeState:
+    """Create or exactly reconcile one Mason App's requested/effective user API scopes."""
+    desired = tuple(sorted(desired_scopes))
+    try:
+        app = client.get_app(name)
+    except AgentCliError as exc:
+        if exc.error_code not in _APP_NOT_FOUND_CODES:
+            raise
+        client.create_app(name, list(desired))
+        requested, effective = _poll_effective_user_api_scopes(
+            client,
+            name,
+            desired,
+            poll_timeout_s=poll_timeout_s,
+            poll_interval_s=poll_interval_s,
+            propagating_from_scopes=(),
+        )
+        return _AppScopeState(requested, effective, changed=bool(desired), created=True)
+
+    initial_requested = _app_scopes(app, "user_api_scopes")
+    stale_scopes = tuple(sorted(set(initial_requested) - set(desired)))
+    if stale_scopes and not confirm_removal:
+        raise AgentCliError(
+            f"App '{name}' currently requests user API scopes Mason would remove: "
+            f"{', '.join(stale_scopes)}.",
+            hint=f"Adopt {json.dumps(list(stale_scopes))} by adding each scope to "
+            "extra_user_api_scopes in .mason/project.toml, "
+            "or explicitly authorize their exact removal by re-running with "
+            "--confirm-user-scope-removal.",
+        )
+
+    changed = initial_requested != desired
+    if changed:
+        latest = client.get_app(name)
+        latest_requested = _app_scopes(latest, "user_api_scopes")
+        if latest_requested != initial_requested:
+            raise AgentCliError(
+                f"App '{name}' user API scopes changed concurrently before Mason's update "
+                f"(initially {list(initial_requested)!r}, now {list(latest_requested)!r}).",
+                hint="Review the App's requested scopes and re-run deploy; Mason did not overwrite "
+                "the concurrent change.",
+            )
+        client.update_app(name, list(desired))
+
+    requested, effective = _poll_effective_user_api_scopes(
+        client,
+        name,
+        desired,
+        poll_timeout_s=poll_timeout_s,
+        poll_interval_s=poll_interval_s,
+        propagating_from_scopes=initial_requested if changed else None,
+    )
+    return _AppScopeState(requested, effective, changed=changed, created=False)
 
 
 # --- app.yaml manifest handling ---------------------------------------------
@@ -352,6 +602,11 @@ def _grant_store_access(
     default=None,
     help="Workspace destination for the synced source (defaults to a per-user path).",
 )
+@click.option(
+    "--confirm-user-scope-removal",
+    is_flag=True,
+    help="Authorize removal of existing App user API scopes not declared by this Mason project.",
+)
 @click.pass_obj
 def deploy(
     obj,
@@ -365,11 +620,30 @@ def deploy(
     no_create_stores,
     pip_index_url,
     workspace_path,
+    confirm_user_scope_removal,
 ) -> None:
     """Deploy an agent: provision its stores, wire them in, and roll out the deployment."""
     _validate_deployment_name(name)
     source_dir = pathlib.Path(source)
+    auth_plan = _load_deployment_auth_plan(source_dir)
     client = obj.client()
+
+    # A canonical Mason registry owns the App's exact requested user scopes. Reconcile before
+    # provisioning stores or syncing source so an unsafe removal, concurrent edit, or unavailable
+    # effective scope fails without any downstream deployment mutation.
+    scope_state: _AppScopeState | None = None
+    auth_warnings: list[dict[str, Any]] = []
+    if auth_plan is not None:
+        scope_state = _reconcile_user_api_scopes(
+            client,
+            name,
+            auth_plan.desired_scopes,
+            confirm_removal=confirm_user_scope_removal,
+        )
+        auth_warnings = _deployment_auth_warnings(auth_plan, scope_state)
+        _emit_deployment_auth_warnings(auth_warnings, obj.output)
+        if scope_state.created:
+            _wait_for_running(name, obj.profile)
 
     # 1. Provision / resolve stores and build the env to inject.
     env_updates = resolve_store_env(
@@ -394,6 +668,8 @@ def deploy(
         for env in _PIP_INDEX_ENVS:
             env_updates[env] = pip_index_url
         provisioned["Package index"] = pip_index_url
+    if auth_plan is not None:
+        provisioned["User API scopes"] = ", ".join(auth_plan.desired_scopes) or "none"
 
     # 2. Patch the app.yaml manifest with the store identifiers.
     scaffolded = False
@@ -401,7 +677,7 @@ def deploy(
         scaffolded = _upsert_manifest_env(source_dir, env_updates)
 
     # 3. Roll out the deployment (Databricks Apps runtime).
-    if not _deployment_exists(name, obj.profile):
+    if auth_plan is None and not _deployment_exists(name, obj.profile):
         _databricks(["apps", "create", name], obj.profile)
         # `apps create` returns before the app's compute is up, but `apps deploy` requires it to be
         # RUNNING — so wait for it, or the first deploy races and fails ("not in RUNNING state").
@@ -429,17 +705,25 @@ def deploy(
             )
 
     if obj.output == "json":
-        render.emit_json(
-            {
-                "deployment": name,
-                "workspace_path": ws_path,
-                "env": env_updates,
-                "store_grant": "skipped"
-                if not grants_stores
-                else ("granted" if grant_error is None else "failed"),
-                "store_grant_error": grant_error,
+        payload = {
+            "deployment": name,
+            "workspace_path": ws_path,
+            "env": env_updates,
+            "store_grant": "skipped"
+            if not grants_stores
+            else ("granted" if grant_error is None else "failed"),
+            "store_grant_error": grant_error,
+        }
+        if auth_plan is not None and scope_state is not None:
+            payload["user_api_scopes"] = {
+                "desired": list(auth_plan.desired_scopes),
+                "requested": list(scope_state.requested_scopes),
+                "effective": list(scope_state.effective_scopes),
+                "changed": scope_state.changed,
             }
-        )
+            payload["app_auth_integration_ids"] = list(auth_plan.app_auth_integration_ids)
+            payload["warnings"] = auth_warnings
+        render.emit_json(payload)
         return
 
     steps = [f"mason deployments logs {name}", f"mason deployments get {name}"]

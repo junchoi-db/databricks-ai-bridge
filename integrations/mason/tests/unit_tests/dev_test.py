@@ -42,6 +42,22 @@ def test_dev_reuses_existing_venv(tmp_path: pathlib.Path):
     assert "--prepare-environment" not in db.call_args.args[0]
 
 
+def test_dev_marks_apps_run_local_for_request_user_auth(tmp_path: pathlib.Path):
+    (tmp_path / "app.yaml").write_text("command: []\n")
+    (tmp_path / ".venv").mkdir()
+
+    with mock.patch.object(dev_mod, "_databricks") as db:
+        result = CliRunner().invoke(dev_mod.dev, ["--source", str(tmp_path)], obj=_Ctx())
+
+    assert result.exit_code == 0, result.output
+    assert db.call_args.args[0] == [
+        "apps",
+        "run-local",
+        "--env",
+        "DATABRICKS_MASON_RUN_LOCAL=1",
+    ]
+
+
 def test_dev_force_prepare_overrides_existing_venv(tmp_path: pathlib.Path):
     (tmp_path / "app.yaml").write_text("command: []\n")
     (tmp_path / ".venv").mkdir()

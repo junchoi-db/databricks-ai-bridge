@@ -8,9 +8,17 @@ import os
 import pathlib
 import tempfile
 from collections.abc import Iterable
+from typing import cast
 
 from databricks_mason.errors import AgentCliError
-from databricks_mason.integrations import Integration, MCPService, Sandbox, Scope, UCFunction
+from databricks_mason.integrations import (
+    AuthMode,
+    Integration,
+    MCPService,
+    Sandbox,
+    Scope,
+    UCFunction,
+)
 
 _DEFAULT_RELATIVE_PATH = pathlib.Path("agent/databricks_tools.py")
 _REGISTRY_PATHS = {
@@ -75,39 +83,65 @@ def _scope(node: ast.AST) -> Scope:
     return Scope(node.func.attr, value, permission)  # type: ignore[arg-type]
 
 
-def _integration(node: ast.AST) -> Integration:
+def _auth(values: dict[str, ast.AST]) -> tuple[AuthMode, bool]:
+    if "auth" not in values:
+        return "user", True
+    value = _string(values["auth"], "integration auth mode")
+    if value not in {"user", "app"}:
+        raise AgentCliError(f"Unsupported integration auth mode {value!r}.")
+    return cast(AuthMode, value), False
+
+
+def _integration(node: ast.AST) -> tuple[Integration, bool]:
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
         raise AgentCliError("The CLI-owned integration registry is not in canonical form.")
     name = node.func.attr
     if name == "Sandbox":
         call = _constructor(node, name)
         values = _keywords(call)
-        if set(values) != {"id", "scopes"} or not isinstance(values["scopes"], ast.Tuple):
+        if set(values) not in ({"id", "scopes"}, {"id", "scopes", "auth"}) or not isinstance(
+            values["scopes"], ast.Tuple
+        ):
             raise AgentCliError("The CLI-owned Sandbox integration is not in canonical form.")
-        return Sandbox(
-            id=_string(values["id"], "integration id"),
-            scopes=tuple(_scope(item) for item in values["scopes"].elts),
+        auth, legacy_auth = _auth(values)
+        return (
+            Sandbox(
+                id=_string(values["id"], "integration id"),
+                scopes=tuple(_scope(item) for item in values["scopes"].elts),
+                auth=auth,
+            ),
+            legacy_auth,
         )
     if name == "MCPService":
         values = _keywords(_constructor(node, name))
-        if set(values) != {"id", "service"}:
+        if set(values) not in ({"id", "service"}, {"id", "service", "auth"}):
             raise AgentCliError("The CLI-owned MCP integration is not in canonical form.")
-        return MCPService(
-            id=_string(values["id"], "integration id"),
-            service=_string(values["service"], "MCP service"),
+        auth, legacy_auth = _auth(values)
+        return (
+            MCPService(
+                id=_string(values["id"], "integration id"),
+                service=_string(values["service"], "MCP service"),
+                auth=auth,
+            ),
+            legacy_auth,
         )
     if name == "UCFunction":
         values = _keywords(_constructor(node, name))
         if set(values) != {"id", "function"}:
             raise AgentCliError("The CLI-owned UC function integration is not in canonical form.")
-        return UCFunction(
-            id=_string(values["id"], "integration id"),
-            function=_string(values["function"], "UC function"),
+        return (
+            UCFunction(
+                id=_string(values["id"], "integration id"),
+                function=_string(values["function"], "UC function"),
+            ),
+            False,
         )
     raise AgentCliError(f"Unsupported constructor {name!r} in the CLI-owned integration registry.")
 
 
-def _parse(source_text: str) -> tuple[list[Integration], dict[str, int]]:
+def _parse(
+    source_text: str,
+) -> tuple[list[Integration], dict[str, int], frozenset[str]]:
     try:
         tree = ast.parse(source_text)
         compile(tree, "<databricks_tools.py>", "exec")
@@ -137,14 +171,18 @@ def _parse(source_text: str) -> tuple[list[Integration], dict[str, int]]:
         and isinstance(assignment.value, ast.Tuple)
     ):
         raise AgentCliError("The CLI-owned integration registry is not in canonical form.")
-    integrations = [_integration(item) for item in assignment.value.elts]
+    parsed = [_integration(item) for item in assignment.value.elts]
+    integrations = [integration for integration, _ in parsed]
     ids = [item.id for item in integrations]
     if len(ids) != len(set(ids)):
         raise AgentCliError("DATABRICKS_TOOLS integration ids must be unique.")
     lines = {
         item.id: node.lineno for item, node in zip(integrations, assignment.value.elts, strict=True)
     }
-    return integrations, lines
+    legacy_auth_ids = frozenset(
+        integration.id for integration, legacy_auth in parsed if legacy_auth
+    )
+    return integrations, lines, legacy_auth_ids
 
 
 def _canonical_annotation(node: ast.AST) -> bool:
@@ -182,13 +220,20 @@ def _render_integration(integration: Integration) -> list[str]:
         ]
         for scope in integration.scopes:
             lines.extend(_render_scope(scope, "            "))
-        lines.extend(["        ),", "    ),"])
+        lines.extend(
+            [
+                "        ),",
+                f"        auth={json.dumps(integration.auth)},",
+                "    ),",
+            ]
+        )
         return lines
     if isinstance(integration, MCPService):
         return [
             f"{prefix}MCPService(",
             f"        id={json.dumps(integration.id)},",
             f"        service={json.dumps(integration.service)},",
+            f"        auth={json.dumps(integration.auth)},",
             "    ),",
         ]
     return [
@@ -218,9 +263,9 @@ def render_registry(integrations: Iterable[Integration]) -> str:
 def _summary(integration: Integration) -> str:
     if isinstance(integration, Sandbox):
         scopes = ", ".join(f"{scope.resource} ({scope.permission})" for scope in integration.scopes)
-        return f"sandbox: {scopes}"
+        return f"sandbox (auth={integration.auth}): {scopes}"
     if isinstance(integration, MCPService):
-        return f"MCP service: {integration.service}"
+        return f"MCP service (auth={integration.auth}): {integration.service}"
     return f"UC function: {integration.function}"
 
 
@@ -234,12 +279,14 @@ class IntegrationRegistry:
         definition_lines: dict[str, int] | None = None,
         *,
         relative_path: pathlib.Path = _DEFAULT_RELATIVE_PATH,
+        legacy_auth_ids: frozenset[str] | None = None,
     ) -> None:
         self.root = root
         self.path = root / relative_path
         self.relative_path = relative_path
         self.integrations = integrations
         self._definition_lines = definition_lines or {}
+        self.legacy_auth_ids = legacy_auth_ids or frozenset()
 
     @classmethod
     def empty(
@@ -273,18 +320,24 @@ class IntegrationRegistry:
             raise AgentCliError(
                 f"Could not read Databricks integration registry at {path}: {exc}."
             ) from exc
-        integrations, lines = _parse(source_text)
+        integrations, lines, legacy_auth_ids = _parse(source_text)
         return cls(
             project_root,
             integrations,
             lines,
             relative_path=relative_path,
+            legacy_auth_ids=legacy_auth_ids,
         )
 
     def add(self, integration: Integration) -> bool:
         for existing in self.integrations:
             if existing.id != integration.id:
                 continue
+            if existing.id in self.legacy_auth_ids:
+                raise AgentCliError(
+                    f"Integration id {integration.id!r} has unspecified legacy auth.",
+                    hint='Edit its declaration to add auth="user" or auth="app".',
+                )
             if existing == integration:
                 return False
             raise AgentCliError(
@@ -296,6 +349,12 @@ class IntegrationRegistry:
         return True
 
     def write(self) -> pathlib.Path:
+        if self.legacy_auth_ids:
+            rendered = ", ".join(repr(item) for item in sorted(self.legacy_auth_ids))
+            raise AgentCliError(
+                f"Cannot write the integration registry while legacy entries omit auth: "
+                f'{rendered}. Add auth="user" or auth="app" to each declaration.'
+            )
         source_text = render_registry(self.integrations)
         temporary: pathlib.Path | None = None
         try:
@@ -319,7 +378,7 @@ class IntegrationRegistry:
             raise AgentCliError(
                 f"Could not write Databricks integration registry at {self.path}: {exc}."
             ) from exc
-        _, self._definition_lines = _parse(source_text)
+        _, self._definition_lines, self.legacy_auth_ids = _parse(source_text)
         return self.path
 
     def definition_line(self, integration_id: str) -> int:

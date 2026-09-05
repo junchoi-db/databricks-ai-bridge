@@ -20,6 +20,93 @@ def test_sandbox_requires_a_valid_fixed_downscope() -> None:
 
 
 @pytest.mark.parametrize(
+    ("default_integration", "app_integration"),
+    [
+        (
+            lambda: MCPService(id="web", service="system.ai.web_search"),
+            lambda: MCPService(id="web", service="system.ai.web_search", auth="app"),
+        ),
+        (
+            lambda: Sandbox(id="sandbox", scopes=(Scope.volume("main.data.files"),)),
+            lambda: Sandbox(
+                id="sandbox",
+                scopes=(Scope.volume("main.data.files"),),
+                auth="app",
+            ),
+        ),
+    ],
+)
+def test_ai_gateway_integrations_default_to_user_and_accept_app_auth(
+    default_integration,
+    app_integration,
+) -> None:
+    assert default_integration().auth == "user"
+    assert app_integration().auth == "app"
+
+
+@pytest.mark.parametrize(
+    "integration",
+    [
+        lambda: MCPService(
+            id="web",
+            service="system.ai.web_search",
+            auth="creator",  # type: ignore[arg-type]
+        ),
+        lambda: Sandbox(
+            id="sandbox",
+            scopes=(Scope.volume("main.data.files"),),
+            auth="creator",  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_ai_gateway_integrations_reject_unsupported_auth(integration) -> None:
+    with pytest.raises(AgentCliError, match="auth.*creator"):
+        integration()
+
+
+@pytest.mark.parametrize(
+    ("integration", "expected"),
+    [
+        (
+            lambda: MCPService(id="web", service="system.ai.web_search"),
+            frozenset({"ai-gateway"}),
+        ),
+        (
+            lambda: Sandbox(id="sandbox", scopes=(Scope.volume("main.data.files"),)),
+            frozenset({"ai-gateway"}),
+        ),
+        (
+            lambda: MCPService(id="web", service="system.ai.web_search", auth="app"),
+            frozenset(),
+        ),
+        (
+            lambda: Sandbox(
+                id="sandbox",
+                scopes=(Scope.volume("main.data.files"),),
+                auth="app",
+            ),
+            frozenset(),
+        ),
+        (lambda: UCFunction(id="lookup", function="main.tools.lookup"), frozenset()),
+    ],
+)
+def test_integrations_report_required_apps_user_scopes(
+    integration,
+    expected: frozenset[str],
+) -> None:
+    assert integration().required_user_scopes == expected
+
+
+def test_uc_function_does_not_expose_request_auth_configuration() -> None:
+    with pytest.raises(TypeError, match="auth"):
+        UCFunction(
+            id="lookup",
+            function="main.tools.lookup",
+            auth="user",  # type: ignore[unknown-argument]
+        )
+
+
+@pytest.mark.parametrize(
     "integration",
     [
         MCPService(id="web", service="system.ai.web_search"),

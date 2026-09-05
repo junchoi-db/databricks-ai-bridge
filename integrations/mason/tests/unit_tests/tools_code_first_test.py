@@ -57,6 +57,90 @@ def _project(
     return project
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_type", "expected_auth"),
+    [
+        (["add", "mcp", "system.ai.web_search"], MCPService, "user"),
+        (
+            ["add", "sandbox", "--scope", "main.data.files"],
+            Sandbox,
+            "user",
+        ),
+        (
+            ["add", "mcp", "system.ai.web_search", "--auth", "app"],
+            MCPService,
+            "app",
+        ),
+        (
+            [
+                "add",
+                "sandbox",
+                "--scope",
+                "main.data.files",
+                "--auth",
+                "app",
+            ],
+            Sandbox,
+            "app",
+        ),
+    ],
+)
+def test_add_ai_gateway_integration_writes_explicit_auth(
+    tmp_path: pathlib.Path,
+    command: list[str],
+    expected_type: type[MCPService] | type[Sandbox],
+    expected_auth: str,
+) -> None:
+    project = _project(tmp_path, framework="langgraph")
+
+    result = CliRunner().invoke(
+        tools,
+        [*command, "--source", str(project)],
+        obj=_Ctx(),
+    )
+
+    assert result.exit_code == 0, result.output
+    registry = IntegrationRegistry.load(project)
+    assert len(registry.integrations) == 1
+    integration = registry.integrations[0]
+    assert isinstance(integration, expected_type)
+    assert integration.auth == expected_auth
+    assert f'        auth="{expected_auth}",' in registry.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("subcommand", ["mcp", "sandbox"])
+def test_ai_gateway_add_help_shows_user_auth_default(subcommand: str) -> None:
+    result = CliRunner().invoke(tools, ["add", subcommand, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--auth [user|app]" in result.output
+    assert "default: user" in result.output
+
+
+def test_invalid_auth_is_rejected_before_registry_write(tmp_path: pathlib.Path) -> None:
+    project = _project(tmp_path, framework="langgraph")
+    registry_path = project / "agent" / "databricks_tools.py"
+    before = registry_path.read_bytes()
+
+    result = CliRunner().invoke(
+        tools,
+        [
+            "add",
+            "mcp",
+            "system.ai.web_search",
+            "--auth",
+            "creator",
+            "--source",
+            str(project),
+        ],
+        obj=_Ctx(),
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid value for '--auth'" in result.output
+    assert registry_path.read_bytes() == before
+
+
 @pytest.mark.parametrize("framework", ["langgraph", "openai"])
 def test_add_sandbox_generates_code_for_both_supported_frameworks(
     tmp_path: pathlib.Path, framework: str
@@ -95,10 +179,29 @@ def test_add_sandbox_generates_code_for_both_supported_frameworks(
     assert "Attached" in result.output
 
 
-def test_add_sandbox_reports_manual_action_instead_of_guessing_byo_location(
+@pytest.mark.parametrize(
+    ("framework", "expected_import", "expected_snippet"),
+    [
+        (
+            "langgraph",
+            "from databricks_mason.langgraph import load_tools",
+            "*await load_tools(DATABRICKS_TOOLS, workspace_client_for=request_auth.client_for)",
+        ),
+        (
+            "openai",
+            "from databricks_mason.openai import bind_tools",
+            "agent = await bind_tools(agent, DATABRICKS_TOOLS, stack=stack, "
+            "workspace_client_for=request_auth.client_for)",
+        ),
+    ],
+)
+def test_add_sandbox_reports_request_scoped_manual_action_without_guessing_byo_location(
     tmp_path: pathlib.Path,
+    framework: str,
+    expected_import: str,
+    expected_snippet: str,
 ) -> None:
-    project = _project(tmp_path, framework="openai", attached=False)
+    project = _project(tmp_path, framework=framework, attached=False)
 
     result = CliRunner().invoke(
         tools,
@@ -109,8 +212,8 @@ def test_add_sandbox_reports_manual_action_instead_of_guessing_byo_location(
     assert result.exit_code == 0, result.output
     assert "Configured, not attached" in result.output
     assert "from agent.databricks_tools import DATABRICKS_TOOLS" in result.output
-    assert "from databricks_mason.openai import bind_tools" in result.output
-    assert "bind_tools" in result.output
+    assert expected_import in result.output
+    assert expected_snippet in result.output
     assert "agent/agent.py:" not in result.output
 
 
@@ -248,7 +351,9 @@ def test_existing_mcp_and_uc_function_commands_generate_the_shared_registry(
     assert isinstance(integrations[1], UCFunction)
 
 
-def test_identical_add_is_byte_stable_and_conflict_does_not_write(tmp_path: pathlib.Path) -> None:
+def test_identical_explicit_auth_is_byte_stable_and_auth_conflict_does_not_write(
+    tmp_path: pathlib.Path,
+) -> None:
     project = _project(tmp_path, framework="langgraph")
     runner = CliRunner()
     command = [
@@ -256,6 +361,8 @@ def test_identical_add_is_byte_stable_and_conflict_does_not_write(tmp_path: path
         "sandbox",
         "--scope",
         "main.data.files",
+        "--auth",
+        "app",
         "--source",
         str(project),
     ]
@@ -270,7 +377,9 @@ def test_identical_add_is_byte_stable_and_conflict_does_not_write(tmp_path: path
             "add",
             "sandbox",
             "--scope",
-            "main.data.other",
+            "main.data.files",
+            "--auth",
+            "user",
             "--source",
             str(project),
         ],
@@ -283,8 +392,8 @@ def test_identical_add_is_byte_stable_and_conflict_does_not_write(tmp_path: path
     assert f"Definition: {path}:" in second.output
     assert "Configured, not attached" in second.output
     assert conflict.exit_code != 0
-    assert "main.data.files" in conflict.output
-    assert "main.data.other" in conflict.output
+    assert "auth=app" in conflict.output
+    assert "auth=user" in conflict.output
     assert path.read_bytes() == original
 
 

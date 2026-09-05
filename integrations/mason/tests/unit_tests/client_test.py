@@ -5,6 +5,8 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from databricks.sdk.errors import NotFound
+from databricks.sdk.service.apps import App
 
 from databricks_mason.client import (
     MasonClient,
@@ -224,3 +226,103 @@ def test_delete_session_store_normalizes_path(workspace_client):
     c, do = _client(workspace_client)
     c.delete_session_store("session-stores/s1")
     do.assert_called_once_with("DELETE", "/api/agents/v1/session-stores/s1", query=None, body=None)
+
+
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_get_app_uses_typed_sdk_api(workspace_client):
+    c, _ = _client(workspace_client)
+    expected = App(
+        name="agent",
+        user_api_scopes=["ai-gateway"],
+        effective_user_api_scopes=["ai-gateway", "openid"],
+    )
+    workspace_client.return_value.apps.get.return_value = expected
+
+    assert c.get_app("agent") is expected
+    workspace_client.return_value.apps.get.assert_called_once_with("agent")
+
+
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_get_app_normalizes_sdk_not_found_without_error_code(workspace_client):
+    c, _ = _client(workspace_client)
+    workspace_client.return_value.apps.get.side_effect = NotFound("missing")
+
+    with pytest.raises(AgentCliError) as exc_info:
+        c.get_app("agent")
+
+    assert exc_info.value.error_code == "NOT_FOUND"
+
+
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_create_app_sends_initial_typed_user_api_scopes(workspace_client):
+    c, _ = _client(workspace_client)
+    expected = App(name="agent", user_api_scopes=["ai-gateway", "sql"])
+    waiter = mock.Mock(response=expected)
+    waiter.result.return_value = expected
+    workspace_client.return_value.apps.create.return_value = waiter
+
+    assert c.create_app("agent", ["ai-gateway", "sql"]) is expected
+
+    request = workspace_client.return_value.apps.create.call_args.args[0]
+    assert isinstance(request, App)
+    assert request.as_dict() == {
+        "name": "agent",
+        "user_api_scopes": ["ai-gateway", "sql"],
+    }
+
+
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_update_app_masks_the_update_to_user_api_scopes(workspace_client):
+    c, _ = _client(workspace_client)
+    expected = App(name="agent", user_api_scopes=["sql"])
+    workspace_client.return_value.apps.get.return_value = expected
+
+    assert c.update_app("agent", ["sql"]) is expected
+
+    call = workspace_client.return_value.apps.create_update_and_wait.call_args
+    assert call.args == ("agent", "user_api_scopes")
+    request = call.kwargs["app"]
+    assert isinstance(request, App)
+    assert request.as_dict() == {"name": "agent", "user_api_scopes": ["sql"]}
+    workspace_client.return_value.apps.update.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_app_scope_writes_preserve_an_explicit_empty_list_on_the_wire(workspace_client, operation):
+    c, _ = _client(workspace_client)
+    response = App(name="agent", user_api_scopes=[])
+    workspace_client.return_value.apps.create.return_value = mock.Mock(response=response)
+    workspace_client.return_value.apps.get.return_value = response
+
+    if operation == "create":
+        c.create_app("agent", [])
+        request = workspace_client.return_value.apps.create.call_args.args[0]
+    else:
+        c.update_app("agent", [])
+        request = workspace_client.return_value.apps.create_update_and_wait.call_args.kwargs["app"]
+
+    assert isinstance(request, App)
+    assert request.as_dict() == {"name": "agent", "user_api_scopes": []}
+
+
+@pytest.mark.parametrize("operation", ["get", "create", "update"])
+@mock.patch("databricks_mason.client.WorkspaceClient")
+def test_app_sdk_errors_are_wrapped_as_agent_cli_errors(workspace_client, operation):
+    c, _ = _client(workspace_client)
+
+    class AppsApiError(RuntimeError):
+        error_code = "PERMISSION_DENIED"
+
+    sdk_operation = "create_update_and_wait" if operation == "update" else operation
+    getattr(workspace_client.return_value.apps, sdk_operation).side_effect = AppsApiError("denied")
+
+    with pytest.raises(AgentCliError) as exc_info:
+        if operation == "get":
+            c.get_app("agent")
+        elif operation == "create":
+            c.create_app("agent", ["ai-gateway"])
+        else:
+            c.update_app("agent", ["ai-gateway"])
+
+    assert exc_info.value.error_code == "PERMISSION_DENIED"

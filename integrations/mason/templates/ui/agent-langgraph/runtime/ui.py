@@ -10,12 +10,19 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from databricks_mason import workspace_client
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from runtime.runtime import rotate_session_cookie
+
+from databricks_mason import workspace_client
+from databricks_mason.runtime import (
+    InvocationAuthPolicy,
+    MissingUserAuthorization,
+    RequestAuthContext,
+    is_deployed_app,
+)
 
 _UI_ROOT = Path(__file__).resolve().parent.parent / "ui"
 _INSTANCE_ID = uuid.uuid4().hex[:12]  # identifies this process in the UI
@@ -24,6 +31,8 @@ _MEMORY_ACTOR_ENV = "AGENT_MEMORY_ACTOR_ID"
 _SESSION_STORE_ENV = "AGENT_SESSION_STORE"
 _SESSION_ACTOR_ENV = "AGENT_SESSION_ACTOR_ID"
 _AGENTS_API = "/api/agents/v1"
+_FORWARDED_ACCESS_TOKEN_HEADER = "x-forwarded-access-token"
+_MANAGED_STATE_ERROR_DETAIL = "Managed state request failed."
 _MESSAGE_ROLES = {
     "ai",
     "assistant",
@@ -178,12 +187,9 @@ def _state_client() -> _ManagedStateClient:
 async def _managed_call(operation, *args):
     try:
         return await asyncio.to_thread(operation, *args)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        code = getattr(exc, "error_code", None)
-        detail = f"{code}: {exc}" if code else str(exc)
-        raise HTTPException(status_code=502, detail=detail) from exc
+    except Exception:
+        pass
+    raise HTTPException(status_code=502, detail=_MANAGED_STATE_ERROR_DETAIL) from None
 
 
 def _require_memory() -> None:
@@ -202,12 +208,17 @@ def _require_session() -> None:
         )
 
 
-async def _checkpoint_history(session_id: str) -> dict[str, Any]:
+async def _checkpoint_history(
+    routing_session: str,
+    state_session_id: str,
+    request_auth: RequestAuthContext,
+) -> dict[str, Any]:
     from agent.agent import create_agent_graph
+
     from databricks_mason.langgraph.session_store import thread_config
 
-    graph = await create_agent_graph()
-    snapshot = await graph.aget_state(thread_config(session_id))
+    graph = await create_agent_graph(request_auth)
+    snapshot = await graph.aget_state(thread_config(state_session_id))
     values = snapshot.values if isinstance(snapshot.values, dict) else {}
     items = []
     for index, message in enumerate(values.get("messages", [])):
@@ -223,7 +234,55 @@ async def _checkpoint_history(session_id: str) -> dict[str, Any]:
         for task in getattr(snapshot, "tasks", ())
         for interrupt in getattr(task, "interrupts", ())
     ]
-    return {"session_id": session_id, "session_items": items, "interrupts": interrupts}
+    return {"session_id": routing_session, "session_items": items, "interrupts": interrupts}
+
+
+def _request_state(
+    request: Request,
+    auth_policy: InvocationAuthPolicy,
+) -> tuple[str, str, RequestAuthContext]:
+    routing_session = str(request.state.session_id)
+    forwarded_token = (
+        request.headers.get(_FORWARDED_ACCESS_TOKEN_HEADER)
+        if auth_policy.requires_user_credentials
+        else None
+    )
+    if _deployed_user_auth(auth_policy) and not (forwarded_token or "").strip():
+        raise MissingUserAuthorization()
+    request_auth = RequestAuthContext.from_forwarded_token(forwarded_token)
+    return routing_session, request_auth.state_key(routing_session), request_auth
+
+
+def _deployed_user_auth(auth_policy: InvocationAuthPolicy) -> bool:
+    return auth_policy.requires_user_credentials and is_deployed_app()
+
+
+def _externalize_state_ids(
+    value: Any,
+    state_session_id: str,
+    routing_session: str,
+) -> Any:
+    if isinstance(value, str):
+        return value.replace(state_session_id, routing_session)
+    if isinstance(value, dict):
+        return {
+            _externalize_state_ids(key, state_session_id, routing_session): _externalize_state_ids(
+                item, state_session_id, routing_session
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_externalize_state_ids(item, state_session_id, routing_session) for item in value]
+    if isinstance(value, tuple):
+        return tuple(
+            _externalize_state_ids(item, state_session_id, routing_session) for item in value
+        )
+    return value
+
+
+def _external_session(result: dict, state_session_id: str, routing_session: str) -> dict:
+    external = _externalize_state_ids(result, state_session_id, routing_session)
+    return {**external, "session_id": routing_session}
 
 
 def _chat_sessions(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -253,9 +312,15 @@ def _chat_session_items(result: dict[str, Any]) -> dict[str, Any]:
     return {**result, "session_items": items}
 
 
-def install_ui(app: FastAPI) -> None:
+def install_ui(app: FastAPI, auth_policy: InvocationAuthPolicy) -> None:
     """Mount the Mason demo UI and its runtime control endpoints."""
     app.mount("/ui-assets", StaticFiles(directory=_UI_ROOT), name="mason-demo-ui-assets")
+
+    @app.exception_handler(MissingUserAuthorization)
+    async def missing_user_authorization(
+        _request: Request, error: MissingUserAuthorization
+    ) -> JSONResponse:
+        return JSONResponse(error.to_error_envelope(), status_code=error.status)
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -274,9 +339,9 @@ def install_ui(app: FastAPI) -> None:
             "session_id": request.state.session_id,
             "instance_id": _INSTANCE_ID,
             "viewer": viewer,
-            "deployed": bool(os.getenv("DATABRICKS_APP_NAME")),
+            "deployed": is_deployed_app(),
             "streaming": {"enabled": True, "transport": "Server-sent events"},
-            "background": {"enabled": True, "durable": False},
+            "background": {"enabled": auth_policy.allows_background, "durable": False},
             "session": {
                 "durable": bool(session_store),
                 "managed": bool(session_store),
@@ -314,11 +379,13 @@ def install_ui(app: FastAPI) -> None:
     @app.post("/api/demo/sessions", include_in_schema=False)
     async def ensure_session(request: Request) -> dict:
         _require_session()
-        return await _managed_call(_state_client().ensure_session, request.state.session_id)
+        routing_session, state_session_id, _ = _request_state(request, auth_policy)
+        result = await _managed_call(_state_client().ensure_session, state_session_id)
+        return _external_session(result, state_session_id, routing_session)
 
     @app.get("/api/demo/sessions", include_in_schema=False)
     async def list_sessions(request: Request) -> dict:
-        session_id = request.state.session_id
+        session_id = str(request.state.session_id)
         if not _session_store():
             return {
                 "sessions": [
@@ -331,6 +398,13 @@ def install_ui(app: FastAPI) -> None:
                 "current_session_id": session_id,
                 "managed": False,
             }
+        if _deployed_user_auth(auth_policy):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Managed session listing is unavailable for user-authenticated integrations."
+                ),
+            )
         result = await _managed_call(_state_client().list_sessions)
         return {
             **result,
@@ -342,6 +416,13 @@ def install_ui(app: FastAPI) -> None:
     @app.post("/api/demo/sessions/{session_id}/open", include_in_schema=False)
     async def open_session(request: Request, session_id: str) -> JSONResponse:
         _require_session()
+        if _deployed_user_auth(auth_policy):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Managed session switching is unavailable for user-authenticated integrations."
+                ),
+            )
         session = await _managed_call(_state_client().get_session, session_id)
         if session.get("actor_id") != _session_actor():
             raise HTTPException(status_code=403, detail="Session belongs to another actor.")
@@ -360,21 +441,26 @@ def install_ui(app: FastAPI) -> None:
     @app.get("/api/demo/session", include_in_schema=False)
     async def get_session(request: Request) -> dict:
         _require_session()
-        return await _managed_call(_state_client().get_session, request.state.session_id)
+        routing_session, state_session_id, _ = _request_state(request, auth_policy)
+        result = await _managed_call(_state_client().get_session, state_session_id)
+        return _external_session(result, state_session_id, routing_session)
 
     @app.post("/api/demo/session/items", include_in_schema=False)
     async def append_session_items(request: Request, payload: SessionItemsRequest) -> dict:
         _require_session()
-        return await _managed_call(
+        routing_session, state_session_id, _ = _request_state(request, auth_policy)
+        result = await _managed_call(
             _state_client().append_session_items,
-            request.state.session_id,
+            state_session_id,
             payload.items,
         )
+        return _externalize_state_ids(result, state_session_id, routing_session)
 
     @app.get("/api/demo/session/items", include_in_schema=False)
     async def list_session_items(request: Request) -> dict:
-        session_id = request.state.session_id
+        routing_session, state_session_id, request_auth = _request_state(request, auth_policy)
         if _session_store():
-            result = await _managed_call(_state_client().list_session_items, session_id)
-            return _chat_session_items(result)
-        return await _checkpoint_history(session_id)
+            result = await _managed_call(_state_client().list_session_items, state_session_id)
+            result = _chat_session_items(result)
+            return _externalize_state_ids(result, state_session_id, routing_session)
+        return await _checkpoint_history(routing_session, state_session_id, request_auth)
