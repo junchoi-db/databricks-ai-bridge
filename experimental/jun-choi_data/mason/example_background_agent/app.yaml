@@ -1,0 +1,19 @@
+command:
+- uv
+- run
+- start-server
+env:
+- name: AGENT_MEMORY_STORE
+  value: app-dustpw-memory
+- name: AGENT_SESSION_STORE
+  value: app-dustpw-sessions
+- name: DATABRICKS_MASON_RUNTIME_STORE_LAKEBASE_ENDPOINT
+  value: projects/agent-mason-agenttoml-368220-runtime-store/branches/production/endpoints/primary
+- name: DATABRICKS_MASON_RUNTIME_STORE_SCHEMA
+  value: databricks_mason_runtime_f4d3008e8044
+- name: PIP_INDEX_URL
+  value: https://pypi.org/simple/
+- name: UV_INDEX_URL
+  value: https://pypi.org/simple/
+- name: UV_DEFAULT_INDEX
+  value: https://pypi.org/simple/

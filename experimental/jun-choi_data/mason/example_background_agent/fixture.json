@@ -1,0 +1,35 @@
+{
+  "app_name": "agent-mason-agenttoml-368220",
+  "base_name": "agenttoml-368220",
+  "caller": "jun.choi@databricks.com",
+  "caller_id": "6357521728819386",
+  "commit": "11ffe9e171a15621998e7b2f6bde55f10b8c690c",
+  "module_hashes": {
+    "agent_project.py": "518380663b6fd9d5b0fda8a836cbf01480916d31babe87eb45d1c5d0b3cbd97c",
+    "cli/app_auth.py": "f9d1de84526db2f97b3648bd68f8eac98bbf9eba9b1fb4bb6cad18a5a69e2948",
+    "langgraph/mcp.py": "a3df8c0d8aa7e3de860c9f7d91f6769f8bb59e56a024e2da6be80e5a3877701b",
+    "runtime/app.py": "83a23e7109a6a27abab9f18b3108dbc137a7223f0247dfb92dbd9503f33d9064",
+    "runtime/auth.py": "a98e8769575a8c55504778e91b18be99d30705f23918908fcf22469947a338d4",
+    "runtime/mcp_auth.py": "773e7793b2981be7bc03e7006f5e95fa35bcb15bf8eb5fa78293d2066a9ec23c",
+    "runtime/tool_manifest.py": "f23037aa0939209089737ae8870c8a87055c9de276187debc787560644ad48b2"
+  },
+  "profile": "df1",
+  "provider_nonce": "mason-agents-v2-8dd01ed6-a376-4146-914f-356763d6de5c",
+  "runtime_store_project": "agent-mason-agenttoml-368220-runtime-store",
+  "source_hashes": {
+    "agent_project.py": "518380663b6fd9d5b0fda8a836cbf01480916d31babe87eb45d1c5d0b3cbd97c",
+    "cli/app_auth.py": "f9d1de84526db2f97b3648bd68f8eac98bbf9eba9b1fb4bb6cad18a5a69e2948",
+    "langgraph/mcp.py": "a3df8c0d8aa7e3de860c9f7d91f6769f8bb59e56a024e2da6be80e5a3877701b",
+    "runtime/app.py": "83a23e7109a6a27abab9f18b3108dbc137a7223f0247dfb92dbd9503f33d9064",
+    "runtime/auth.py": "a98e8769575a8c55504778e91b18be99d30705f23918908fcf22469947a338d4",
+    "runtime/mcp_auth.py": "773e7793b2981be7bc03e7006f5e95fa35bcb15bf8eb5fa78293d2066a9ec23c",
+    "runtime/tool_manifest.py": "f23037aa0939209089737ae8870c8a87055c9de276187debc787560644ad48b2"
+  },
+  "started_at": "2026-09-24T06:52:20.167072+00:00",
+  "wheel": "/home/jun.choi/custom_agent_oss/e2e/20260924-anshul-bugbash-agent-toml-rerun-v6/dist/databricks_mason-0.2.0-py3-none-any.whl",
+  "wheel_sha256": "e66ced6b6bfcae6e06b4a33c8cb09f69c84eda2f973ed0bd4aa13db2930ff94c",
+  "working_tree_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "working_tree_dirty": false,
+  "workspace_path": "/Workspace/Users/jun.choi@databricks.com/mason_deployments/agent-mason-agenttoml-368220",
+  "worktree": "/tmp/databricks-ai-bridge-11ffe9e-agents-v2"
+}

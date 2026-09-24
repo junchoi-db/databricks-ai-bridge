@@ -1,0 +1,37 @@
+schema_version = 1
+
+[agent]
+framework = "langgraph"
+server = "mason"
+deployment_name = "agenttoml-368220"
+
+[memory_store]
+name = "app-dustpw-memory"
+
+[session_store]
+name = "app-dustpw-sessions"
+
+[[tools]]
+id = "gmail_user"
+auth = "user"
+source = {kind = "mcp", service = "system.ai.gmail"}
+[[tools]]
+id = "gmail_app"
+auth = "app"
+source = {kind = "mcp", service = "system.ai.gmail"}
+[[tools]]
+id = "atlassian_user"
+auth = "user"
+source = {kind = "mcp", service = "system.ai.atlassian"}
+[[tools]]
+id = "atlassian_app"
+auth = "app"
+source = {kind = "mcp", service = "system.ai.atlassian"}
+[[tools]]
+id = "slack_user"
+auth = "user"
+source = {kind = "mcp", service = "system.ai.slack"}
+[[tools]]
+id = "slack_app"
+auth = "app"
+source = {kind = "mcp", service = "system.ai.slack"}
