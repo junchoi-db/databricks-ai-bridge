@@ -152,6 +152,11 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Local DF1 demo state and vendored development build artifacts
+.demo-state/
+vendor/
+uv.lock
+
 # Cython debug symbols
 cython_debug/
 
