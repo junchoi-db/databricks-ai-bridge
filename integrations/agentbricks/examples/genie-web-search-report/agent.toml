@@ -1,0 +1,35 @@
+schema_version = 1
+
+[agent]
+framework = "openai"
+server = "agentbricks"
+
+[memory_store]
+name = "genie-web-search-report-gqcpwl-memory"
+
+[session_store]
+name = "genie-web-search-report-gqcpwl-sessions"
+
+[tracing]
+experiment_name = "/Shared/agentbricks_traces/genie-web-search-report-gqcpwl"
+
+[[tools]]
+id = "slack"
+auth = "user"
+source = { kind = "mcp", service = "system.ai.slack" }
+
+[[tools]]
+id = "genie_assets"
+auth = "user"
+source = { kind = "genie_agent", space_id = "00000000000000000000000000000000" }
+
+[[tools]]
+id = "web_search"
+auth = "user"
+source = { kind = "mcp", service = "system.ai.web_search" }
+
+[[tools]]
+id = "report_sandbox"
+auth = "user"
+source = { kind = "sandbox", service = "system.ai.sandbox" }
+policy = { downscope = [{ resource = "volume:supervisor_agent.not_deployed.reports", permission = "read_write" }] }
