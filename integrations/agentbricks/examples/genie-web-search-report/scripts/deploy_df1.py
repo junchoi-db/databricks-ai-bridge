@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ from scripts.setup_df1 import EXPECTED_USER, PROFILE
 
 
 REQUIRED_SCOPES = {"ai-gateway", "files", "genie"}
-DEPLOY_SOURCE = ROOT / ".demo-state" / "deploy-source"
+DEPLOY_SOURCE = Path(tempfile.gettempdir()) / "agentbricks-genie-report-deploy"
 CLI = ROOT.parents[1] / ".venv" / "bin" / "ab"
 
 
@@ -49,7 +50,13 @@ def prepare_deploy_source(state: dict[str, Any]) -> Path:
         ROOT,
         DEPLOY_SOURCE,
         ignore=shutil.ignore_patterns(
-            ".demo-state", ".venv", ".pytest_cache", "__pycache__", "*.pyc"
+            ".demo-state",
+            ".env",
+            ".venv",
+            ".pytest_cache",
+            ".ruff_cache",
+            "__pycache__",
+            "*.pyc",
         ),
     )
     (DEPLOY_SOURCE / "agent.toml").write_text(render_manifest(state), encoding="utf-8")

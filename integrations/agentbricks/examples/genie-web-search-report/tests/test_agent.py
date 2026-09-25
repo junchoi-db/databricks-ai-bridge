@@ -106,10 +106,12 @@ async def test_agent_events_omit_unavailable_mcp_servers(monkeypatch):
         return [healthy, *unavailable]
 
     create_agent = MagicMock(return_value=object())
+    reset_ledger = MagicMock()
 
     monkeypatch.setattr(agent_module, "mcp_servers", mcp_servers)
     monkeypatch.setattr(agent_module, "build_mcp_servers", lambda: [])
     monkeypatch.setattr(agent_module, "create_agent", create_agent)
+    monkeypatch.setattr(agent_module, "reset_ledger", reset_ledger)
     monkeypatch.setattr(agent_module, "session_store", lambda _session_id, _actor: None)
     monkeypatch.setattr(
         agent_module.Runner,
@@ -117,8 +119,11 @@ async def test_agent_events_omit_unavailable_mcp_servers(monkeypatch):
         lambda *_args, **_kwargs: _FakeStreamResult([], [], None),
     )
 
-    async with agent_module.run_agent([], session_id="s", actor="actor") as result:
+    async with agent_module.run_agent(
+        [], session_id="s", actor="actor", report_run_id="external-run"
+    ) as result:
         assert [event async for event in result.stream_events()] == []
+    reset_ledger.assert_called_once_with("external-run")
     # create_agent(actor, mcp) — the healthy servers are the second positional arg.
     assert create_agent.call_args.args[1] == [healthy]
     assert healthy.cache_tools_list is True
@@ -297,14 +302,24 @@ async def test_adapter_recovery_marks_replayed_agent_input(monkeypatch):
     assert calls == [
         (
             payload["messages"],
-            {"session_id": "session-1", "actor": "session-1", "model": None},
+            {
+                "session_id": "session-1",
+                "actor": "session-1",
+                "model": None,
+                "report_run_id": "session-1",
+            },
         ),
         (
             [
                 {"role": "developer", "content": adapter._RECOVERY_INSTRUCTION},
                 *payload["messages"],
             ],
-            {"session_id": "session-1", "actor": "session-1", "model": None},
+            {
+                "session_id": "session-1",
+                "actor": "session-1",
+                "model": None,
+                "report_run_id": "session-1",
+            },
         ),
     ]
     assert payload["messages"] == [{"role": "user", "content": "hi"}]

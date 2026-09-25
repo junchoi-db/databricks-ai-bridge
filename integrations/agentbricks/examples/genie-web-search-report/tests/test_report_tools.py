@@ -40,6 +40,14 @@ def test_report_rejects_unknown_evidence_ids() -> None:
     assert "unknown evidence id: web-999" in errors
 
 
+def test_report_requires_current_run_id() -> None:
+    ledger = EvidenceLedger(run_id="run-1")
+
+    errors = ledger.validate_report("## Sources\n")
+
+    assert "missing run_id: run-1" in errors
+
+
 def test_evidence_metadata_removes_credentials_recursively() -> None:
     ledger = EvidenceLedger(run_id="run-1")
 
@@ -49,8 +57,8 @@ def test_evidence_metadata_removes_credentials_recursively() -> None:
                 "title": "Field report",
                 "url": "https://databricks.slack.com/archives/C088VN8U4E5/p1790353973998359",
                 "excerpt": "Observed behavior",
+                "message_ts": "1789056476.567349",
                 "metadata": {
-                    "thread_ts": "1789056476.567349",
                     "headers": {"authorization": "Bearer secret"},
                     "cookie": "secret",
                 },
@@ -59,7 +67,7 @@ def test_evidence_metadata_removes_credentials_recursively() -> None:
     )
 
     serialized = json.dumps(items[0].source_metadata)
-    assert "thread_ts" in serialized
+    assert "1789056476.567349" in serialized
     assert "secret" not in serialized
     assert "authorization" not in serialized
     assert "cookie" not in serialized
@@ -74,14 +82,44 @@ def test_reset_ledger_isolates_invocations() -> None:
 
 
 def test_report_tools_auto_register() -> None:
-    names = {tool.name for tool in all_tools()}
+    tools = {tool.name: tool for tool in all_tools()}
 
     assert {
         "record_slack_evidence",
         "record_genie_assets",
         "record_web_evidence",
         "validate_report",
-    } <= names
+    } <= set(tools)
+    assert set(tools["record_slack_evidence"].params_json_schema["required"]) == {
+        "results_json",
+        "thread_ts",
+    }
+    assert set(tools["record_genie_assets"].params_json_schema["required"]) == {
+        "results_json",
+        "conversation_id",
+        "message_id",
+    }
+
+
+def test_genie_evidence_preserves_conversation_identifiers() -> None:
+    ledger = EvidenceLedger(run_id="run-1")
+
+    items = ledger.add_genie_results(
+        [
+            {
+                "title": "Asset",
+                "url": "https://docs.databricks.com/aws/en/generative-ai/mcp",
+                "description": "Managed MCP",
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+            }
+        ]
+    )
+
+    assert items[0].source_metadata == {
+        "conversation_id": "conversation-1",
+        "message_id": "message-1",
+    }
 
 
 def test_validation_payload_returns_fixed_paths(monkeypatch) -> None:
@@ -89,6 +127,7 @@ def test_validation_payload_returns_fixed_paths(monkeypatch) -> None:
     reset_ledger("run-1")
     markdown = "\n\n".join(
         [
+            "run-1",
             "## Executive summary",
             "## Internal field report",
             "## Cataloged assets",

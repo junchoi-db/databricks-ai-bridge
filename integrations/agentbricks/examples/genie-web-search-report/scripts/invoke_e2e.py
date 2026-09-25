@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -95,6 +96,7 @@ def _invoke(state: dict[str, Any], run_id: str) -> dict[str, Any]:
             "session_id": run_id,
             "messages": [{"role": "user", "content": REPORT_PROMPT}],
         },
+        "background": True,
     }
     completed = subprocess.run(
         [
@@ -109,14 +111,14 @@ def _invoke(state: dict[str, Any], run_id: str) -> dict[str, Any]:
             "--path",
             "/api/invocations",
             "--timeout",
-            "1200",
+            "60",
             "--json",
             json.dumps(body),
         ],
         cwd=ROOT,
         text=True,
         capture_output=True,
-        timeout=1250,
+        timeout=70,
         check=False,
     )
     StateStore(EVIDENCE_DIR / f"invoke-{run_id}.json").save(
@@ -131,7 +133,50 @@ def _invoke(state: dict[str, Any], run_id: str) -> dict[str, Any]:
     )
     if completed.returncode:
         raise RuntimeError(f"deployed invocation failed: {completed.stderr[-6000:]}")
-    return json.loads(completed.stdout)
+    response = json.loads(completed.stdout)
+    status = str(response.get("body", {}).get("status", "")).lower()
+    if status == "completed":
+        return response
+    if status not in {"queued", "active"}:
+        raise RuntimeError(f"unexpected background invocation response: {response}")
+
+    deadline = time.monotonic() + 1200
+    while time.monotonic() < deadline:
+        time.sleep(15)
+        polled = subprocess.run(
+            [
+                str(CLI),
+                "--profile",
+                PROFILE,
+                "-o",
+                "json",
+                "endpoint",
+                "invoke",
+                state["deployment"]["app_name"],
+                "--method",
+                "GET",
+                "--path",
+                f"/api/invocations/{run_id}",
+                "--timeout",
+                "60",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=70,
+            check=False,
+        )
+        if polled.returncode:
+            raise RuntimeError(
+                f"invocation status poll failed: {polled.stderr[-6000:]}"
+            )
+        response = json.loads(polled.stdout)
+        status = str(response.get("body", {}).get("status", "")).lower()
+        if status == "completed":
+            return response
+        if status == "failed":
+            raise RuntimeError(f"background invocation failed: {response}")
+    raise TimeoutError(f"background invocation {run_id} did not finish within 1200s")
 
 
 def run_e2e() -> dict[str, Any]:

@@ -48,7 +48,7 @@ def resource_names(suffix: str) -> ResourceNames:
         volume=f"{schema}.reports",
         report_path=f"{volume_root}/databricks_web_search_report.md",
         evidence_path=f"{volume_root}/evidence.json",
-        app=f"mason-genie-report-{suffix}",
+        app=f"genie-{suffix}",
         genie_title=f"Mason web search docs {suffix}",
     )
 
@@ -105,7 +105,7 @@ def build_serialized_space(table: str) -> dict[str, Any]:
         "instructions": {
             "text_instructions": [
                 {
-                    "id": "web_search_asset_catalog",
+                    "id": "74a8b0f412c44e8bab5e676e88cd2ec4",
                     "content": [
                         "Use only the web_search_assets table. Return asset_id, topic, title, url, "
                         "description, and keywords for assets relevant to the user's question."
@@ -169,6 +169,17 @@ def setup() -> dict[str, Any]:
             raise RuntimeError(
                 "existing setup state belongs to another workspace or principal"
             )
+        if state.get("space_id"):
+            return state
+        space = client.genie.create_space(
+            warehouse_id=WAREHOUSE_ID,
+            title=state["genie_title"],
+            description="Curated official Databricks documentation asset catalog",
+            serialized_space=json.dumps(build_serialized_space(state["table"])),
+        )
+        state["space_id"] = space.space_id
+        state["resources"].append({"kind": "genie", "name": space.space_id})
+        store.save(state)
         return state
 
     names = resource_names(uuid4().hex[:8])

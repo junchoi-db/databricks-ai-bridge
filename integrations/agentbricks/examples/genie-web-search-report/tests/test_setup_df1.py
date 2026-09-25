@@ -1,8 +1,12 @@
 import json
+import re
 import stat
+from dataclasses import asdict
+from types import SimpleNamespace
 
+import scripts.setup_df1 as setup_df1
 from scripts.common import StateStore
-from scripts.setup_df1 import asset_rows, build_serialized_space, resource_names
+from scripts.setup_df1 import asset_rows, build_serialized_space, resource_names, setup
 
 
 def test_resource_names_share_one_suffix() -> None:
@@ -13,7 +17,8 @@ def test_resource_names_share_one_suffix() -> None:
     assert names.volume == names.schema + ".reports"
     assert names.report_path.endswith("/reports/databricks_web_search_report.md")
     assert names.evidence_path.endswith("/reports/evidence.json")
-    assert names.app == "mason-genie-report-ab12cd34"
+    assert names.app == "genie-ab12cd34"
+    assert len(f"agent-bricks-{names.app}") <= 30
 
 
 def test_resource_names_reject_unsafe_suffix() -> None:
@@ -47,6 +52,7 @@ def test_genie_space_uses_only_asset_table() -> None:
     }
     instructions = payload["instructions"]["text_instructions"]
     assert len(instructions) == 1
+    assert re.fullmatch(r"[0-9a-f]{32}", instructions[0]["id"])
     assert "web_search_assets" in instructions[0]["content"][0]
 
 
@@ -59,3 +65,41 @@ def test_state_store_writes_private_atomic_json(tmp_path) -> None:
     assert json.loads(path.read_text()) == {"suffix": "ab12cd34", "resources": []}
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_setup_resumes_missing_genie_space(monkeypatch, tmp_path) -> None:
+    names = resource_names("ab12cd34")
+    state_path = tmp_path / "setup-state.json"
+    StateStore(state_path).save(
+        {
+            **asdict(names),
+            "workspace_host": "https://df1.example.com",
+            "caller": setup_df1.EXPECTED_USER,
+            "resources": [
+                {"kind": "schema", "name": names.schema},
+                {"kind": "table", "name": names.table},
+                {"kind": "volume", "name": names.volume},
+            ],
+            "seed_control": {"status": {"state": "SUCCEEDED"}},
+        }
+    )
+
+    created: list[dict] = []
+    client = SimpleNamespace(
+        config=SimpleNamespace(host="https://df1.example.com"),
+        current_user=SimpleNamespace(
+            me=lambda: SimpleNamespace(user_name=setup_df1.EXPECTED_USER)
+        ),
+        genie=SimpleNamespace(
+            create_space=lambda **kwargs: (
+                created.append(kwargs) or SimpleNamespace(space_id="a" * 32)
+            )
+        ),
+    )
+    monkeypatch.setattr(setup_df1, "SETUP_STATE_PATH", state_path)
+    monkeypatch.setattr(setup_df1, "WorkspaceClient", lambda profile: client)
+
+    resumed = setup()
+
+    assert resumed["space_id"] == "a" * 32
+    assert created[0]["title"] == names.genie_title

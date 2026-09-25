@@ -107,7 +107,18 @@ class EvidenceLedger:
                 title=str(result.get("title") or "Slack field report"),
                 uri=str(result["url"]),
                 excerpt=str(result["excerpt"]),
-                metadata=result.get("metadata"),
+                metadata={
+                    **(
+                        result.get("metadata")
+                        if isinstance(result.get("metadata"), dict)
+                        else {}
+                    ),
+                    **{
+                        key: result[key]
+                        for key in ("thread_ts", "message_ts")
+                        if result.get(key) is not None
+                    },
+                },
             )
             for result in results
         ]
@@ -121,7 +132,18 @@ class EvidenceLedger:
                 title=str(result["title"]),
                 uri=str(result["url"]),
                 excerpt=str(result.get("excerpt") or result.get("description") or ""),
-                metadata=result.get("metadata"),
+                metadata={
+                    **(
+                        result.get("metadata")
+                        if isinstance(result.get("metadata"), dict)
+                        else {}
+                    ),
+                    **{
+                        key: result[key]
+                        for key in ("conversation_id", "message_id")
+                        if result.get(key) is not None
+                    },
+                },
             )
             for result in results
         ]
@@ -163,6 +185,8 @@ class EvidenceLedger:
             for section in REQUIRED_SECTIONS
             if section not in markdown
         ]
+        if self.run_id not in markdown:
+            errors.append(f"missing run_id: {self.run_id}")
         known = {item.evidence_id for item in self.items}
         for evidence_id in sorted(set(_EVIDENCE_REF.findall(markdown)) - known):
             errors.append(f"unknown evidence id: {evidence_id}")
@@ -209,16 +233,25 @@ def validation_payload(markdown: str) -> dict[str, Any]:
 
 
 @function_tool
-def record_slack_evidence(results_json: str) -> str:
+def record_slack_evidence(results_json: str, thread_ts: str) -> str:
     """Record normalized observations from the fixed Slack thread as internal field evidence."""
-    items = current_ledger().add_slack_results(_decode_results(results_json))
+    results = _decode_results(results_json)
+    for result in results:
+        result["thread_ts"] = thread_ts
+    items = current_ledger().add_slack_results(results)
     return json.dumps([asdict(item) for item in items], sort_keys=True)
 
 
 @function_tool
-def record_genie_assets(results_json: str) -> str:
+def record_genie_assets(
+    results_json: str, conversation_id: str, message_id: str
+) -> str:
     """Record normalized asset rows returned by the configured native Genie Agent."""
-    items = current_ledger().add_genie_results(_decode_results(results_json))
+    results = _decode_results(results_json)
+    for result in results:
+        result["conversation_id"] = conversation_id
+        result["message_id"] = message_id
+    items = current_ledger().add_genie_results(results)
     return json.dumps([asdict(item) for item in items], sort_keys=True)
 
 

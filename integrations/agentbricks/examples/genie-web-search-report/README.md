@@ -26,7 +26,7 @@ Setup creates a unique schema named
 - report `databricks_web_search_report.md` in that Volume;
 - evidence file `evidence.json` in that Volume;
 - Genie space `Mason web search docs <suffix>` on warehouse `59d2ebcf58480621`; and
-- App deployment `agent-bricks-mason-genie-report-<suffix>`.
+- App deployment `agent-bricks-genie-<suffix>`.
 
 `.demo-state/setup-state.json` records every exact name and ID. The file is private (`0600`) and
 gitignored.
@@ -77,10 +77,11 @@ space and Volume into `agent.toml`, adds `REPORT_SCHEMA_NAME` to `app.yaml`, and
 `files`, user-token forwarding is enabled, and the App service principal has neither `SELECT` nor
 Volume read/write privileges.
 
-`scripts/invoke_e2e.py` makes one foreground `/api/invocations` call as the current user. It then
-downloads both Volume artifacts and checks the fixed Slack timestamp, Genie conversation/message
-IDs, all three evidence kinds, official citation hosts, evidence references, App scopes, and
-negative App-principal grants. Success is recorded at `.demo-state/result.json`.
+`scripts/invoke_e2e.py` submits one background `/api/invocations` call as the current user, then
+polls its durable status to completion. It downloads both Volume artifacts and checks the fixed
+Slack timestamp, Genie conversation/message IDs, all three evidence kinds, official citation
+hosts, evidence references, App scopes, and negative App-principal grants. Success is recorded at
+`.demo-state/result.json`.
 
 The workflow intentionally leaves the successful resources deployed for the demo. Inspect:
 

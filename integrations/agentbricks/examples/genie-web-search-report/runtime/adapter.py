@@ -105,6 +105,7 @@ async def _invoke_agent(
         session_id=internal_session_id,
         actor=actor,
         model=model if isinstance(model, str) else None,
+        report_run_id=session_id,
         **auth_kwargs,
     ) as result:
         async for event in _serialize_events(result):

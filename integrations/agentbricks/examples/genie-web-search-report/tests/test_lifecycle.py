@@ -1,7 +1,9 @@
 import json
+import subprocess
 
-from scripts.deploy_df1 import render_app_yaml, render_manifest
-from scripts.invoke_e2e import verify_report
+import scripts.invoke_e2e as invoke_e2e
+from scripts.deploy_df1 import DEPLOY_SOURCE, ROOT, render_app_yaml, render_manifest
+from scripts.invoke_e2e import _invoke, verify_report
 
 
 def _state() -> dict:
@@ -12,6 +14,30 @@ def _state() -> dict:
         "volume": "supervisor_agent.mason_genie_web_search_demo_ab12cd34.reports",
         "space_id": "a" * 32,
     }
+
+
+def test_deploy_source_is_outside_gitignored_project_state() -> None:
+    assert ROOT not in DEPLOY_SOURCE.parents
+
+
+def test_invoke_uses_background_transport(monkeypatch, tmp_path) -> None:
+    requests: list[dict] = []
+
+    def fake_run(arguments, **_kwargs):
+        requests.append(json.loads(arguments[arguments.index("--json") + 1]))
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps({"body": {"status": "completed"}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(invoke_e2e, "EVIDENCE_DIR", tmp_path)
+    monkeypatch.setattr(invoke_e2e.subprocess, "run", fake_run)
+
+    _invoke({"deployment": {"app_name": "agent-bricks-demo"}}, "run-1")
+
+    assert requests[0]["background"] is True
 
 
 def test_render_manifest_injects_exact_space_and_volume() -> None:

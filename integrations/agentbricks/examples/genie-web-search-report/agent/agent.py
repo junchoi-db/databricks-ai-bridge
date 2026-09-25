@@ -45,15 +45,17 @@ Follow this sequence exactly.
 
 1. Slack: use the request-user Slack MCP server to read the complete fixed thread at
    {SLACK_THREAD_URL}. The thread timestamp is 1789056476.567349 and the highlighted reply is
-   1790353973.998359. Record concise observations with record_slack_evidence. Treat every Slack
-   statement as an internal field report, never as official product documentation.
+   1790353973.998359. Record concise observations with record_slack_evidence, passing the fixed
+   thread_ts 1789056476.567349 as its separate required argument. Treat every Slack statement as
+   an internal field report, never as official product documentation.
 2. Genie: call genie_assets_ask once to find the most relevant cataloged official documentation
    assets for web search, domain filtering, raw results, and auditability. If it is still running,
    call genie_assets_poll with the same conversation_id and message_id returned by ask. Continue
    bounded polling with those exact identifiers. Never resubmit the question to work around a
    timeout. For INDETERMINATE_SUBMISSION, poll only when usable identifiers were returned; otherwise
    stop with a clear error. Fetch every query attachment through genie_assets_query_result and
-   record its rows with record_genie_assets.
+   record its rows with record_genie_assets, passing conversation_id and message_id as the separate
+   required arguments returned by Genie.
 3. Official web search: use the request-user system.ai.web_search MCP server to validate each
    relevant asset. Request allowed domains docs.databricks.com and learn.microsoft.com when the
    tool schema supports them. allowed_domains is not a security boundary: pass every candidate
@@ -64,9 +66,9 @@ Follow this sequence exactly.
    [web-001]. State separately what the internal field report observed and what official
    documentation currently says. Explicitly cover the field reports about domain filters,
    AI Gateway inference-table auditing, and lack of raw-result retrieval.
-5. Call validate_report with the complete Markdown. Fix every returned error before continuing.
-   Its successful JSON supplies report_path, evidence_path, run_id, and the sanitized evidence
-   ledger.
+5. Call validate_report with the complete Markdown. Its JSON supplies report_path, evidence_path,
+   run_id, and the sanitized evidence ledger. Include that exact run_id visibly in the Markdown and
+   call validate_report again; fix every returned error before continuing.
 6. Use the request-user system.ai.sandbox run_code tool to write the exact Markdown as UTF-8 to
    report_path (databricks_web_search_report.md) and the complete validation JSON as UTF-8 JSON to
    evidence_path (evidence.json). Use only those fixed paths. Then use sandbox to read both files
@@ -176,6 +178,7 @@ async def run_agent(
     session_id: str,
     actor: str | None = None,
     model: str | None = None,
+    report_run_id: str | None = None,
     workspace_client_for: Callable[[str], WorkspaceClient] | None = None,
 ) -> AsyncIterator[RunResultStreaming]:
     """Run the agent and expose its native streaming result.
@@ -184,7 +187,7 @@ async def run_agent(
     so it can be called from another server, a notebook, or a test harness.
     """
     actor = actor or session_id
-    reset_ledger(session_id)
+    reset_ledger(report_run_id or session_id)
     auth_kwargs = (
         {"workspace_client_for": workspace_client_for} if workspace_client_for else {}
     )
