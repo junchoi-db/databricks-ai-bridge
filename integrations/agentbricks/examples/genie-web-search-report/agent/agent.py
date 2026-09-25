@@ -14,6 +14,7 @@ from agent.mcps import build_mcp_servers
 
 # Importing the tools package auto-registers every tool module.
 from agent.tools import all_tools
+from agent.tools.report_tools import reset_ledger
 from databricks_agentkit import workspace_client, workspace_headers
 from databricks_agentkit.openai import (
     configure_tracing,
@@ -32,11 +33,55 @@ logger = logging.getLogger(__name__)
 # your workspace exposes — the demo chat app's picker lists what's available.
 MODEL = "system.ai.claude-sonnet-4-5"
 
+SLACK_THREAD_URL = (
+    "https://databricks.slack.com/archives/C088VN8U4E5/"
+    "p1790353973998359?thread_ts=1789056476.567349&cid=C088VN8U4E5"
+)
+MAX_TURNS = 30
+
+INSTRUCTIONS = f"""You create one evidence-backed Databricks documentation report.
+
+Follow this sequence exactly.
+
+1. Slack: use the request-user Slack MCP server to read the complete fixed thread at
+   {SLACK_THREAD_URL}. The thread timestamp is 1789056476.567349 and the highlighted reply is
+   1790353973.998359. Record concise observations with record_slack_evidence. Treat every Slack
+   statement as an internal field report, never as official product documentation.
+2. Genie: call genie_assets_ask once to find the most relevant cataloged official documentation
+   assets for web search, domain filtering, raw results, and auditability. If it is still running,
+   call genie_assets_poll with the same conversation_id and message_id returned by ask. Continue
+   bounded polling with those exact identifiers. Never resubmit the question to work around a
+   timeout. For INDETERMINATE_SUBMISSION, poll only when usable identifiers were returned; otherwise
+   stop with a clear error. Fetch every query attachment through genie_assets_query_result and
+   record its rows with record_genie_assets.
+3. Official web search: use the request-user system.ai.web_search MCP server to validate each
+   relevant asset. Request allowed domains docs.databricks.com and learn.microsoft.com when the
+   tool schema supports them. allowed_domains is not a security boundary: pass every candidate
+   result through record_web_evidence and cite only accepted results.
+4. Draft Markdown with exactly these sections: ## Executive summary, ## Internal field report,
+   ## Cataloged assets, ## Official documentation findings, ## Discrepancies and limitations, and
+   ## Sources. Every factual bullet must cite an evidence ID such as [slack-001], [genie-001], or
+   [web-001]. State separately what the internal field report observed and what official
+   documentation currently says. Explicitly cover the field reports about domain filters,
+   AI Gateway inference-table auditing, and lack of raw-result retrieval.
+5. Call validate_report with the complete Markdown. Fix every returned error before continuing.
+   Its successful JSON supplies report_path, evidence_path, run_id, and the sanitized evidence
+   ledger.
+6. Use the request-user system.ai.sandbox run_code tool to write the exact Markdown as UTF-8 to
+   report_path (databricks_web_search_report.md) and the complete validation JSON as UTF-8 JSON to
+   evidence_path (evidence.json). Use only those fixed paths. Then use sandbox to read both files
+   back and verify they contain run_id. Do not pass connector credentials or raw request headers to
+   sandbox.
+7. Return one compact JSON object with status, run_id, report_path, evidence_path, evidence counts,
+   rejected citations, Genie conversation_id/message_id, and warnings. Do not claim success unless
+   all source stages ran, validation returned no errors, and you read both files back.
+"""
+
 # Tools that require human approval before they run. Add a tool's name here and the agent pauses when
 # the model calls it, emitting an `interrupt` event; the client resumes by sending `resume` with the
 # same session id. The tools declare `needs_approval=True` themselves (see agent/tools/); this set is
 # how the runtime knows which pending calls to surface. Empty it to disable approval gating.
-REQUIRE_APPROVAL = {"send_message"}
+REQUIRE_APPROVAL: set[str] = set()
 
 # OpenAI Sessions persist transcript history, not a paused RunState. Keep pending approvals local.
 _pending_runs: dict[str, RunState] = {}
@@ -93,8 +138,8 @@ def create_agent(
 ) -> Agent:
     """Build the OpenAI Agents SDK agent: tools, memory, MCP servers, and model."""
     return Agent(
-        name="Agent",
-        instructions="You are a helpful assistant.",
+        name="Databricks documentation report agent",
+        instructions=INSTRUCTIONS,
         model=model or MODEL,
         tools=[
             *all_tools(),
@@ -137,6 +182,7 @@ async def run_agent(
     so it can be called from another server, a notebook, or a test harness.
     """
     actor = actor or session_id
+    reset_ledger(session_id)
     auth_kwargs = {"workspace_client_for": workspace_client_for} if workspace_client_for else {}
     servers = await mcp_servers(build_mcp_servers(), **auth_kwargs)
     async with MCPServerManager(servers) as manager:
@@ -176,12 +222,13 @@ async def run_agent(
         )
         with start_trace(name="invoke", inputs=agent_input, session_id=session_id) as span:
             if isinstance(agent_input, RunState):
-                result = Runner.run_streamed(agent, agent_input)
+                result = Runner.run_streamed(agent, agent_input, max_turns=MAX_TURNS)
             else:
                 result = Runner.run_streamed(
                     agent,
                     agent_input,
                     session=session_store(session_id, actor),
+                    max_turns=MAX_TURNS,
                 )
 
             try:

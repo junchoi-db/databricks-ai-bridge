@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from contextvars import ContextVar
 from dataclasses import asdict
@@ -9,7 +10,12 @@ from typing import Any
 
 from agents import function_tool
 
-from agent.report_contract import EvidenceItem, canonical_official_url, validate_evidence
+from agent.report_contract import (
+    EvidenceItem,
+    canonical_official_url,
+    validate_evidence,
+    volume_paths,
+)
 
 
 REQUIRED_SECTIONS = (
@@ -182,6 +188,17 @@ def _decode_results(results_json: str) -> list[dict[str, Any]]:
     return value
 
 
+def validation_payload(markdown: str) -> dict[str, Any]:
+    ledger = current_ledger()
+    paths = volume_paths(os.environ["REPORT_SCHEMA_NAME"])
+    return {
+        "errors": ledger.validate_report(markdown),
+        **ledger.as_dict(),
+        "report_path": paths.report,
+        "evidence_path": paths.evidence,
+    }
+
+
 @function_tool
 def record_slack_evidence(results_json: str) -> str:
     """Record normalized observations from the fixed Slack thread as internal field evidence."""
@@ -209,4 +226,4 @@ def record_web_evidence(results_json: str) -> str:
 @function_tool
 def validate_report(markdown: str) -> str:
     """Validate required report sections and every inline evidence reference before writing."""
-    return json.dumps({"errors": current_ledger().validate_report(markdown)}, sort_keys=True)
+    return json.dumps(validation_payload(markdown), sort_keys=True)

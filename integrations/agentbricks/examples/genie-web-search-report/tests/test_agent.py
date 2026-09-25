@@ -21,17 +21,18 @@ def test_tools_autoregister():
     tools = all_tools()
     assert tools, "expected the sample tool to auto-register"
     assert all(isinstance(t, FunctionTool) for t in tools)
-    assert {"get_current_time", "send_message"} <= {t.name for t in tools}
+    assert {t.name for t in tools} == {
+        "record_genie_assets",
+        "record_slack_evidence",
+        "record_web_evidence",
+        "validate_report",
+    }
 
 
-def test_gated_tool_needs_approval():
-    # The gated demo tool must exist, be listed for approval, and declare needs_approval, or the HITL
-    # demo does nothing.
+def test_report_demo_has_no_approval_gated_local_tools():
     from agent.agent import REQUIRE_APPROVAL
 
-    assert "send_message" in REQUIRE_APPROVAL
-    send = next(t for t in all_tools() if t.name == "send_message")
-    assert send.needs_approval is True
+    assert REQUIRE_APPROVAL == set()
 
 
 class _FakeItem:

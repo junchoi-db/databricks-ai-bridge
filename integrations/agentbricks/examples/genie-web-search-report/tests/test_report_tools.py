@@ -1,7 +1,7 @@
 import json
 
 from agent.tools import all_tools
-from agent.tools.report_tools import EvidenceLedger, reset_ledger
+from agent.tools.report_tools import EvidenceLedger, reset_ledger, validation_payload
 
 
 def test_web_evidence_separates_rejected_domains() -> None:
@@ -82,3 +82,25 @@ def test_report_tools_auto_register() -> None:
         "record_web_evidence",
         "validate_report",
     } <= names
+
+
+def test_validation_payload_returns_fixed_paths(monkeypatch) -> None:
+    monkeypatch.setenv("REPORT_SCHEMA_NAME", "mason_genie_web_search_demo_ab12cd34")
+    reset_ledger("run-1")
+    markdown = "\n\n".join(
+        [
+            "## Executive summary",
+            "## Internal field report",
+            "## Cataloged assets",
+            "## Official documentation findings",
+            "## Discrepancies and limitations",
+            "## Sources",
+        ]
+    )
+
+    payload = validation_payload(markdown)
+
+    assert payload["errors"] == []
+    assert payload["run_id"] == "run-1"
+    assert payload["report_path"].endswith("/databricks_web_search_report.md")
+    assert payload["evidence_path"].endswith("/evidence.json")
