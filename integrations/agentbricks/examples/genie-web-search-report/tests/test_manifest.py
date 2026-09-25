@@ -24,3 +24,27 @@ def test_all_managed_tools_use_request_user_auth() -> None:
             "permission": "read_write",
         }
     ]
+
+
+def test_readme_documents_complete_df1_lifecycle() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    for command in (
+        "scripts/setup_df1.py",
+        "scripts/deploy_df1.py",
+        "scripts/invoke_e2e.py",
+        "scripts/teardown_df1.py",
+    ):
+        assert command in readme
+    for integration in (
+        "system.ai.slack",
+        "genie-agent",
+        "system.ai.web_search",
+        "system.ai.sandbox",
+    ):
+        assert integration in readme
+    assert "1789056476.567349" in readme
+    assert "ai-gateway" in readme
+    assert "genie" in readme
+    assert "files" in readme
+    assert "leaves the successful resources deployed" in readme
