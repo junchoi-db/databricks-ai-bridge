@@ -160,7 +160,9 @@ async def test_agent_events_propagate_request_user_mcp_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_serialize_events_relays_interrupt_as_native_event():
-    approval = _FakeToolApproval("send_message", '{"recipient": "x", "body": "y"}', "call-1")
+    approval = _FakeToolApproval(
+        "send_message", '{"recipient": "x", "body": "y"}', "call-1"
+    )
     sentinel_state = object()
     result = _FakeStreamResult([], [approval], sentinel_state)
 
@@ -283,14 +285,20 @@ async def test_adapter_recovery_marks_replayed_agent_input(monkeypatch):
         yield _FakeStreamResult([], [], None)
 
     monkeypatch.setattr(adapter, "run_agent", fake_run_agent)
-    payload = {"session_id": "session-1", "messages": [{"role": "user", "content": "hi"}]}
+    payload = {
+        "session_id": "session-1",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
     context = SimpleNamespace(session_id="runtime-session", emit=AsyncMock())
 
     await adapter.invoke(payload, context)
     await adapter.recover(payload, context)
 
     assert calls == [
-        (payload["messages"], {"session_id": "session-1", "actor": "session-1", "model": None}),
+        (
+            payload["messages"],
+            {"session_id": "session-1", "actor": "session-1", "model": None},
+        ),
         (
             [
                 {"role": "developer", "content": adapter._RECOVERY_INSTRUCTION},

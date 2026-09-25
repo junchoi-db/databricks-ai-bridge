@@ -92,7 +92,9 @@ async def _invoke_agent(
             400,
         )
     internal_session_id = (
-        auth.namespace("session", session_id) if auth and payload.get("session_id") else session_id
+        auth.namespace("session", session_id)
+        if auth and payload.get("session_id")
+        else session_id
     )
     actor = auth.namespace("actor", actor) if auth else actor
     auth_kwargs = {"workspace_client_for": auth.client_for} if user_auth else {}
@@ -118,8 +120,15 @@ async def _invoke_agent(
 
     interrupted = bool(outputs and outputs[-1].get("type") == "interrupt")
     return {
-        "output": [event["message"] if event["type"] == "message" else event for event in outputs],
-        **({"session_id": session_id} if not user_auth or payload.get("session_id") else {}),
+        "output": [
+            event["message"] if event["type"] == "message" else event
+            for event in outputs
+        ],
+        **(
+            {"session_id": session_id}
+            if not user_auth or payload.get("session_id")
+            else {}
+        ),
         "status": "interrupted" if interrupted else "completed",
     }
 
@@ -128,7 +137,11 @@ async def _serialize_events(result: RunResultStreaming) -> AsyncGenerator[dict, 
     async for event in result.stream_events():
         if event.type == "raw_response_event":
             if isinstance(event.data, ResponseTextDeltaEvent) and event.data.delta:
-                yield {"type": "delta", "content": event.data.delta, "id": event.data.item_id}
+                yield {
+                    "type": "delta",
+                    "content": event.data.delta,
+                    "id": event.data.item_id,
+                }
         elif event.type == "run_item_stream_event":
             if message := _normalize_item(event.item):
                 yield {"type": "message", "message": message}
@@ -163,10 +176,16 @@ def _normalize_item(item: Any) -> dict | None:
         return {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"name": item.tool_name, "args": _tool_args_from_call(item)}],
+            "tool_calls": [
+                {"name": item.tool_name, "args": _tool_args_from_call(item)}
+            ],
         }
     if isinstance(item, ToolCallOutputItem):
-        return {"role": "tool", "name": _tool_call_name(item), "content": str(item.output)}
+        return {
+            "role": "tool",
+            "name": _tool_call_name(item),
+            "content": str(item.output),
+        }
     return None
 
 
@@ -174,7 +193,11 @@ def _tool_args_from_call(item: Any) -> Any:
     import json
 
     raw = item.raw_item
-    args = raw.get("arguments") if isinstance(raw, dict) else getattr(raw, "arguments", None)
+    args = (
+        raw.get("arguments")
+        if isinstance(raw, dict)
+        else getattr(raw, "arguments", None)
+    )
     if isinstance(args, str):
         try:
             return json.loads(args)

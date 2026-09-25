@@ -42,5 +42,7 @@ def test_create_agent_uses_protocol_instructions(monkeypatch) -> None:
     result = create_agent("actor-1")
 
     assert result is constructed.return_value
-    assert constructed.call_args.kwargs["name"] == "Databricks documentation report agent"
+    assert (
+        constructed.call_args.kwargs["name"] == "Databricks documentation report agent"
+    )
     assert constructed.call_args.kwargs["instructions"] == INSTRUCTIONS

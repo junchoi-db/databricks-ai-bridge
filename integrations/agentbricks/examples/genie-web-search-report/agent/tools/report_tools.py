@@ -81,7 +81,9 @@ class EvidenceLedger:
         excerpt: str,
         metadata: Any,
     ) -> EvidenceItem:
-        count = sum(item.evidence_id.startswith(f"{prefix}-") for item in self.items) + 1
+        count = (
+            sum(item.evidence_id.startswith(f"{prefix}-") for item in self.items) + 1
+        )
         evidence = EvidenceItem(
             evidence_id=f"{prefix}-{count:03d}",
             source_kind=source_kind,  # type: ignore[arg-type]
@@ -147,13 +149,20 @@ class EvidenceLedger:
                     title=title,
                     uri=canonical,
                     excerpt=str(result.get("excerpt") or result.get("snippet") or ""),
-                    metadata={**(result.get("metadata") or {}), "host": canonical.split("/", 3)[2]},
+                    metadata={
+                        **(result.get("metadata") or {}),
+                        "host": canonical.split("/", 3)[2],
+                    },
                 )
             )
         return accepted, rejected
 
     def validate_report(self, markdown: str) -> list[str]:
-        errors = [f"missing section: {section}" for section in REQUIRED_SECTIONS if section not in markdown]
+        errors = [
+            f"missing section: {section}"
+            for section in REQUIRED_SECTIONS
+            if section not in markdown
+        ]
         known = {item.evidence_id for item in self.items}
         for evidence_id in sorted(set(_EVIDENCE_REF.findall(markdown)) - known):
             errors.append(f"unknown evidence id: {evidence_id}")

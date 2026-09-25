@@ -117,7 +117,9 @@ def _check_databricks_auth() -> None:
     except Exception as e:
         profile = os.getenv("DATABRICKS_CONFIG_PROFILE")
         target = (
-            f"profile {profile!r}" if profile else "the DEFAULT profile / DATABRICKS_HOST+TOKEN"
+            f"profile {profile!r}"
+            if profile
+            else "the DEFAULT profile / DATABRICKS_HOST+TOKEN"
         )
         raise RuntimeError(
             f"Databricks auth is not configured — the agent can't call the model. Tried {target}.\n"
@@ -183,13 +185,15 @@ async def run_agent(
     """
     actor = actor or session_id
     reset_ledger(session_id)
-    auth_kwargs = {"workspace_client_for": workspace_client_for} if workspace_client_for else {}
+    auth_kwargs = (
+        {"workspace_client_for": workspace_client_for} if workspace_client_for else {}
+    )
     servers = await mcp_servers(build_mcp_servers(), **auth_kwargs)
     async with MCPServerManager(servers) as manager:
         for server, error in manager.errors.items():
-            if getattr(server, "_agentbricks_request_user", False) is True or isinstance(
-                error, AuthError
-            ):
+            if getattr(
+                server, "_agentbricks_request_user", False
+            ) is True or isinstance(error, AuthError):
                 raise error
         active_servers = []
         for server in manager.active_servers:
@@ -200,9 +204,9 @@ async def run_agent(
                 async with asyncio.timeout(manager.connect_timeout_seconds):
                     await server.list_tools()
             except Exception as error:
-                if getattr(server, "_agentbricks_request_user", False) is True or isinstance(
-                    error, AuthError
-                ):
+                if getattr(
+                    server, "_agentbricks_request_user", False
+                ) is True or isinstance(error, AuthError):
                     raise
                 logger.warning(
                     "Failed to list tools from MCP server %r; continuing without it.",
@@ -220,7 +224,9 @@ async def run_agent(
             model=model,
             workspace_client_for=workspace_client_for,
         )
-        with start_trace(name="invoke", inputs=agent_input, session_id=session_id) as span:
+        with start_trace(
+            name="invoke", inputs=agent_input, session_id=session_id
+        ) as span:
             if isinstance(agent_input, RunState):
                 result = Runner.run_streamed(agent, agent_input, max_turns=MAX_TURNS)
             else:

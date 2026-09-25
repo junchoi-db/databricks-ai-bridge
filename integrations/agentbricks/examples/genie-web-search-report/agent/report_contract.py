@@ -41,7 +41,12 @@ class VolumePaths:
 
 def canonical_official_url(url: str) -> str:
     parsed = urlsplit(url)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         raise ValueError("official documentation URL must be credential-free HTTPS")
 
     host = parsed.hostname.lower().rstrip(".")

@@ -19,6 +19,8 @@ def all_tools() -> list[FunctionTool]:
     for module in pkgutil.iter_modules(__path__):
         mod = importlib.import_module(f"{__name__}.{module.name}")
         for _, obj in inspect.getmembers(mod, lambda o: isinstance(o, FunctionTool)):
-            if obj not in tools:  # a tool imported into several modules is collected once
+            if (
+                obj not in tools
+            ):  # a tool imported into several modules is collected once
                 tools.append(obj)
     return tools

@@ -34,6 +34,9 @@ dev = [
 [tool.uv]
 default-groups = ["dev"]
 
+[tool.uv.sources]
+databricks-agentbricks = { git = "https://github.com/databricks/databricks-ai-bridge.git", rev = "81c427266af394216f327fb5c0159db332f1ae64", subdirectory = "integrations/agentbricks" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

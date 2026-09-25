@@ -125,7 +125,8 @@ def _insert_statement(table: str, rows: list[dict[str, Any]]) -> str:
     for row in rows:
         keywords = ", ".join(_sql_string(item) for item in row["keywords"])
         values.append(
-            "(" + ", ".join(
+            "("
+            + ", ".join(
                 [
                     _sql_string(row["asset_id"]),
                     _sql_string(row["topic"]),
@@ -134,7 +135,8 @@ def _insert_statement(table: str, rows: list[dict[str, Any]]) -> str:
                     _sql_string(row["description"]),
                     f"array({keywords})",
                 ]
-            ) + ")"
+            )
+            + ")"
         )
     return f"INSERT INTO {table} VALUES\n" + ",\n".join(values)
 
@@ -160,8 +162,13 @@ def setup() -> dict[str, Any]:
 
     if SETUP_STATE_PATH.exists():
         state = store.load()
-        if state.get("workspace_host") != client.config.host or state.get("caller") != EXPECTED_USER:
-            raise RuntimeError("existing setup state belongs to another workspace or principal")
+        if (
+            state.get("workspace_host") != client.config.host
+            or state.get("caller") != EXPECTED_USER
+        ):
+            raise RuntimeError(
+                "existing setup state belongs to another workspace or principal"
+            )
         return state
 
     names = resource_names(uuid4().hex[:8])

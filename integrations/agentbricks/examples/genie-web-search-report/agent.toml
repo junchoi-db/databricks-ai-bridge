@@ -4,14 +4,8 @@ schema_version = 1
 framework = "openai"
 server = "agentbricks"
 
-[memory_store]
-name = "genie-web-search-report-gqcpwl-memory"
-
-[session_store]
-name = "genie-web-search-report-gqcpwl-sessions"
-
 [tracing]
-experiment_name = "/Shared/agentbricks_traces/genie-web-search-report-gqcpwl"
+disabled = true
 
 [[tools]]
 id = "slack"
