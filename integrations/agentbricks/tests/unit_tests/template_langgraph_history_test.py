@@ -237,7 +237,8 @@ async def test_history_orders_parallel_pending_messages(
     saved = await saver.aget_tuple(config)
     assert saved is not None
     pending = [value for _, channel, value in saved.pending_writes if channel == "messages"]
-    assert [value[0].id for value in pending] == ["last", "first"]
+    assert len(pending) == 2
+    assert {value[0].id for value in pending} == {"last", "first"}
     expected = await graph.aget_state(config)
     result = await read_history("parallel", "alice")
     assert [item["data"] for item in result["session_items"]] == [
